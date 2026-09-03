@@ -1,0 +1,40 @@
+name: Build Worker Bundle
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-bundle.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.8.0"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Worker bundle (wrangler dry-run)
+        run: npx wrangler deploy --dry-run --outdir /tmp/wout
+
+      - name: Create release with bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete bundle-latest --yes --cleanup-tag || true
+          gh release create bundle-latest /tmp/wout/index.js \
+            --title "Worker Bundle" \
+            --notes "Automated build of CloudSSH Worker bundle"
