@@ -4,7 +4,7 @@ import { maskIPAddress } from './host-display';
 import { t } from './i18n';
 import { getNetworkQuality } from './network-quality';
 import { SFTPPanel } from './sftp-panel';
-import { SSHConnectionConfig, SSHTerminal, type TerminalSelectionAnchor } from './terminal';
+import { SSHTerminal, type TerminalSelectionAnchor } from './terminal';
 import { notify } from './ui-feedback';
 
 export type TabState = 'connecting' | 'connected' | 'disconnected';
@@ -16,7 +16,7 @@ export interface TabInfo {
   sftpPanel: SFTPPanel | null;
   agentPanel: AgentPanel | null;
   containerEl: HTMLElement;
-  hostInfo?: { host: string; port: number; username?: string };
+  hostInfo?: { host: string; port: number; username?: string; serverId?: number };
   state: TabState;
   cfLatency?: number;
   cfColo?: string;
@@ -39,6 +39,9 @@ export class TabManager {
   private tabCounter = 0;
   private _isLoggedIn: boolean = false;
 
+  /** 标签右键菜单的 document click 监听器（关闭菜单时统一移除，防止累积） */
+  private tabCtxCloseHandler: ((e: MouseEvent) => void) | null = null;
+
   /** 当所有标签都被关闭时触发，外部可以用它来回到连接页面 */
   private onAllTabsClosed?: () => void;
 
@@ -47,6 +50,9 @@ export class TabManager {
 
   /** 标签数量变化时触发（用于同步返回终端按钮显隐等） */
   private onTabsChanged?: () => void;
+
+  /** 克隆会话请求回调 */
+  private onDuplicateTab?: (tab: TabInfo) => void;
 
   constructor(tabBarId: string, terminalAreaId: string) {
     this.tabBarEl = document.getElementById(tabBarId)!;
@@ -70,9 +76,16 @@ export class TabManager {
     this.onTabsChanged = handler;
   }
 
+  setDuplicateTabHandler(handler: (tab: TabInfo) => void): void {
+    this.onDuplicateTab = handler;
+  }
+
   // ==================== 创建标签 ====================
 
-  createTab(label: string, hostInfo?: { host: string; port: number; username?: string }): TabInfo {
+  createTab(
+    label: string,
+    hostInfo?: { host: string; port: number; username?: string; serverId?: number }
+  ): TabInfo {
     const id = `tab-${++this.tabCounter}-${Date.now()}`;
 
     // 创建终端容器（flex 布局，支持 AgentPanel 右侧分栏）
@@ -215,6 +228,7 @@ export class TabManager {
   switchTab(tabId: string): void {
     const tab = this.tabs.get(tabId);
     if (!tab) return;
+    if (this.activeTabId === tabId) return;
 
     // 隐藏当前活跃标签的 SFTP 面板
     if (this.activeTabId && this.activeTabId !== tabId) {
@@ -229,6 +243,7 @@ export class TabManager {
     // 显示目标标签
     tab.containerEl.style.display = 'flex';
     this.activeTabId = tabId;
+    document.body.classList.toggle('agent-panel-open', tab.agentPanel?.isOpen ?? false);
     document.dispatchEvent(new Event('cloudssh:active-terminal-change'));
 
     // Mount 并 fit 终端
@@ -266,6 +281,7 @@ export class TabManager {
       if (remaining.length > 0) {
         this.switchTab(remaining[remaining.length - 1]);
       } else {
+        document.body.classList.remove('agent-panel-open');
         this.onAllTabsClosed?.();
       }
     }
@@ -295,6 +311,7 @@ export class TabManager {
 
     this.tabs.clear();
     this.activeTabId = null;
+    document.body.classList.remove('agent-panel-open');
     this.renderTabBar();
     this.updateSelectionAction();
     this.onAllTabsClosed?.();
@@ -390,6 +407,12 @@ export class TabManager {
       const label = document.createElement('span');
       label.className = 'tab-label';
       label.textContent = tab.label;
+      label.title = `${t('terminal.doubleClickToRename')}: ${tab.label}`;
+
+      label.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        this.startRenameTab(tab, label);
+      });
 
       const closeBtn = document.createElement('button');
       closeBtn.className = 'tab-close';
@@ -397,6 +420,11 @@ export class TabManager {
       closeBtn.appendChild(this.createIcon('close', '14px'));
 
       tabEl.append(dot, label, closeBtn);
+
+      tabEl.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        this.showTabContextMenu(tab, e.clientX, e.clientY);
+      });
 
       // 点击标签切换
       tabEl.addEventListener('click', (e) => {
@@ -431,6 +459,142 @@ export class TabManager {
     if (state === 'connected') return 'tab-dot-connected';
     if (state === 'connecting') return 'tab-dot-connecting';
     return 'tab-dot-disconnected';
+  }
+
+  // ==================== 标签重命名与右键菜单 ====================
+
+  renameTab(tabId: string, newLabel: string): void {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return;
+    const trimmed = newLabel.trim();
+    if (trimmed) tab.label = trimmed;
+    // 空值/未变更时同样重新渲染，恢复原标签显示（避免重命名输入框卡在标签栏）
+    this.renderTabBar();
+    if (this.activeTabId === tabId) {
+      this.updateStatusBar(tab);
+    }
+  }
+
+  private startRenameTab(tab: TabInfo, labelEl: HTMLElement): void {
+    const currentName = tab.label;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className =
+      'tab-rename-input terminal-input px-1 py-0 text-xs w-28 bg-surface border border-outline-variant';
+    input.value = currentName;
+    input.maxLength = 40;
+
+    let committed = false;
+    const commit = () => {
+      if (committed) return;
+      committed = true;
+      this.renameTab(tab.id, input.value);
+    };
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commit();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        committed = true;
+        this.renderTabBar();
+      }
+    });
+    input.addEventListener('blur', () => commit());
+    input.addEventListener('click', (e) => e.stopPropagation());
+
+    labelEl.replaceWith(input);
+    input.focus();
+    input.select();
+  }
+
+  closeOtherTabs(keepTabId: string): void {
+    for (const tab of Array.from(this.tabs.values())) {
+      if (tab.id !== keepTabId) {
+        this.closeTab(tab.id);
+      }
+    }
+  }
+
+  private showTabContextMenu(tab: TabInfo, x: number, y: number): void {
+    this.hideTabContextMenu();
+
+    const menu = document.createElement('div');
+    menu.id = 'tab-context-menu';
+    menu.className =
+      'fixed z-[100] cyber-box py-1 shadow-2xl text-xs bg-surface border border-outline-variant text-on-surface';
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+
+    const items = [
+      {
+        label: t('terminal.renameTab'),
+        icon: 'edit',
+        action: () => {
+          const tabEl = this.tabBarEl.querySelector(`[data-tab-id="${tab.id}"]`);
+          const labelEl = tabEl?.querySelector('.tab-label') as HTMLElement | null;
+          if (labelEl) this.startRenameTab(tab, labelEl);
+        },
+      },
+      {
+        label: t('terminal.duplicateTab'),
+        icon: 'content_copy',
+        action: () => {
+          this.onDuplicateTab?.(tab);
+        },
+      },
+      {
+        label: t('terminal.closeOtherTabs'),
+        icon: 'close_fullscreen',
+        action: () => {
+          this.closeOtherTabs(tab.id);
+        },
+      },
+      {
+        label: t('terminal.closeTab'),
+        icon: 'close',
+        action: () => {
+          this.closeTab(tab.id);
+        },
+        className: 'text-error',
+      },
+    ];
+
+    for (const item of items) {
+      const itemEl = document.createElement('div');
+      itemEl.className = `flex items-center gap-2 px-3 py-1.5 hover:bg-surface-variant cursor-pointer ${item.className || ''}`;
+      itemEl.appendChild(this.createIcon(item.icon, '14px'));
+      itemEl.appendChild(document.createTextNode(item.label));
+      itemEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.hideTabContextMenu();
+        item.action();
+      });
+      menu.appendChild(itemEl);
+    }
+
+    document.body.appendChild(menu);
+
+    const closeHandler = (e: MouseEvent) => {
+      if (!menu.contains(e.target as Node)) {
+        this.hideTabContextMenu();
+      }
+    };
+    // capture 阶段挂载，确保菜单项等内部 stopPropagation 不影响包含性判断；
+    // setTimeout(0) 避开部分平台 contextmenu 后紧跟的合成 click
+    this.tabCtxCloseHandler = closeHandler;
+    setTimeout(() => document.addEventListener('click', closeHandler, true), 0);
+  }
+
+  private hideTabContextMenu(): void {
+    // 统一移除 document 监听器：菜单项点击（stopPropagation）与外部点击均不残留
+    if (this.tabCtxCloseHandler) {
+      document.removeEventListener('click', this.tabCtxCloseHandler, true);
+      this.tabCtxCloseHandler = null;
+    }
+    const existing = document.getElementById('tab-context-menu');
+    existing?.remove();
   }
 
   private createIcon(name: string, size: string): HTMLSpanElement {

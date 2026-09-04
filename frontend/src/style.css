@@ -1535,6 +1535,16 @@ select optgroup {
   max-width: 120px;
 }
 
+.tab-rename-input {
+  max-width: 120px;
+  height: 20px;
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 20px;
+  border-radius: 2px;
+  outline: none;
+}
+
 .network-latency-item {
   display: inline-flex;
   align-items: center;
@@ -1826,6 +1836,9 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
 
 #agent-panel {
   min-width: 280px;
+  width: min(clamp(420px, 40vw, 600px), 100%);
+  max-width: 100%;
+  height: 100%;
 }
 
 .agent-mobile-back {
@@ -2766,6 +2779,13 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
     padding-bottom: 0;
   }
 
+  /* 移动端打开 AI Agent 时隐藏终端快捷键工具栏，防止遮挡 Agent 底部输入框与操作区 */
+  body.agent-panel-open .mobile-terminal-toolbar,
+  body:has(#agent-panel:not([style*="display: none"])) .mobile-terminal-toolbar,
+  #terminal-section:has(#agent-panel:not([style*="display: none"])) .mobile-terminal-toolbar {
+    display: none !important;
+  }
+
   .mobile-terminal-toolbar-scroll {
     display: flex;
     width: 100%;
@@ -2847,6 +2867,28 @@ html[data-ui-motion="none"] :is(.flicker, .scanlines, .scanline) {
 
   .agent-desktop-close {
     display: none;
+  }
+
+  .agent-quick-chip {
+    min-height: 32px;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  .agent-send-btn {
+    width: 40px;
+    height: 40px;
+  }
+
+  .agent-md-content .agent-md-code-action {
+    min-height: 30px;
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+
+  .agent-confirm button {
+    min-height: 38px;
+    font-size: 12px;
   }
 
   .sftp-panel-header {
