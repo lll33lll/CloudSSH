@@ -500,6 +500,110 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
     return new Response('Method Not Allowed', { status: 405 });
   }
 
+  // /api/servers/:id/memory
+  const memoryMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/memory$/);
+  if (memoryMatch) {
+    const serverId = memoryMatch[1];
+    if (request.method === 'GET') {
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/memory?user_id=${user.id}`, {
+          method: 'GET',
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/work-logs/:logId
+  const singleWorkLogMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/work-logs\/(\d+)$/);
+  if (singleWorkLogMatch) {
+    const serverId = singleWorkLogMatch[1];
+    const logId = singleWorkLogMatch[2];
+    if (request.method === 'DELETE') {
+      return stub.fetch(
+        new Request(
+          `http://internal/internal/servers/${serverId}/work-logs/${logId}?user_id=${user.id}`,
+          {
+            method: 'DELETE',
+          }
+        )
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/work-logs
+  const workLogsMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/work-logs$/);
+  if (workLogsMatch) {
+    const serverId = workLogsMatch[1];
+    if (request.method === 'POST') {
+      const body = await request.json<Record<string, unknown>>();
+      body.user_id = user.id;
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/work-logs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/knowledge/batch
+  const batchKnowledgeMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/knowledge\/batch$/);
+  if (batchKnowledgeMatch) {
+    const serverId = batchKnowledgeMatch[1];
+    if (request.method === 'DELETE') {
+      const body = await request.json<Record<string, unknown>>();
+      body.user_id = user.id;
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/knowledge/batch`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/knowledge/:kId
+  const singleKnowledgeMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/knowledge\/(\d+)$/);
+  if (singleKnowledgeMatch) {
+    const serverId = singleKnowledgeMatch[1];
+    const kId = singleKnowledgeMatch[2];
+    if (request.method === 'DELETE') {
+      return stub.fetch(
+        new Request(
+          `http://internal/internal/servers/${serverId}/knowledge/${kId}?user_id=${user.id}`,
+          {
+            method: 'DELETE',
+          }
+        )
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
+  // /api/servers/:id/knowledge
+  const knowledgeMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/knowledge$/);
+  if (knowledgeMatch) {
+    const serverId = knowledgeMatch[1];
+    if (request.method === 'POST') {
+      const body = await request.json<Record<string, unknown>>();
+      body.user_id = user.id;
+      return stub.fetch(
+        new Request(`http://internal/internal/servers/${serverId}/knowledge`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      );
+    }
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+
   // /api/servers/:id/connect
   const connectMatch = url.pathname.match(/^\/api\/servers\/(\d+)\/connect$/);
   if (connectMatch && request.method === 'POST') {

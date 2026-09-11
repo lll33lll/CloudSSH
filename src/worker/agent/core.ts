@@ -1,11 +1,32 @@
 // Agent Core — control loop that runs inside Durable Object
 
-import { type AgentLocale, getResponseLanguageInstruction, getSystemPrompt } from './prompt';
+import {
+  CONSECUTIVE_TASK_WINDOW_MS,
+  extractDistillationJson,
+  type KnowledgeAction,
+  normalizeKnowledgeInput,
+  normalizeWorkLogInput,
+  type UnifiedServerMemory,
+  WORK_LOG_SUMMARY_MAX_LENGTH,
+  WORK_LOG_TITLE_MAX_LENGTH,
+  type WorkLogMode,
+} from '../../server-memory-schema';
+import {
+  type AgentLocale,
+  extractDistillationSnapshot,
+  formatDistillationPromptInput,
+  formatServerMemoryForPrompt,
+  getResponseLanguageInstruction,
+  getSystemPrompt,
+  MEMORY_DISTILLATION_PROMPT,
+  shouldBypassDistillation,
+} from './prompt';
 import type { TerminalContext } from './terminal-context';
 import { ToolExecutor } from './tool-executor';
 import { AGENT_TOOLS } from './tools';
 import type {
   AgentConfig,
+  AgentMemoryProvider,
   AgentState,
   AIConfig,
   ChatCompletionResponse,
@@ -51,6 +72,10 @@ export class AgentCore {
   private environmentContext: string = '';
   private terminalContextSnapshot: string = '';
   private preferredLocale: AgentLocale = 'zh-CN';
+  private userTimezone: string = 'UTC';
+  private unifiedMemory: UnifiedServerMemory = { workLogs: [], knowledge: [] };
+  private distillationInProgress: boolean = false;
+  private pendingDistillationSnapshot: ChatMessage[] | null = null;
 
   constructor(
     private terminalContext: TerminalContext,
@@ -66,7 +91,9 @@ export class AgentCore {
       exitCode: number;
     }>,
     private askConfirmation: (command: string, reason: string) => Promise<boolean>,
-    config?: Partial<AgentConfig>
+    config?: Partial<AgentConfig>,
+    private memoryProvider?: AgentMemoryProvider,
+    private waitUntil?: (promise: Promise<unknown>) => void
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.toolExecutor = new ToolExecutor(
@@ -150,9 +177,13 @@ export class AgentCore {
   async handleAgentStart(
     userId: string,
     userMessage: string,
-    locale: AgentLocale = 'zh-CN'
+    locale: AgentLocale = 'zh-CN',
+    timezone?: string
   ): Promise<void> {
     this.preferredLocale = locale;
+    if (timezone && typeof timezone === 'string' && timezone.length <= 64) {
+      this.userTimezone = timezone;
+    }
     // Cancel stale timeout from previous loop so it can't abort the new controller
     if (this.loopTimeout) {
       clearTimeout(this.loopTimeout);
@@ -183,6 +214,12 @@ export class AgentCore {
     }
 
     if (isNewSession) {
+      if (this.memoryProvider) {
+        this.unifiedMemory = await this.memoryProvider.fetchUnifiedMemory().catch(() => ({
+          workLogs: [],
+          knowledge: [],
+        }));
+      }
       // 2. 首次启动：采集环境 + 终端上下文（注入 system prompt），用户消息保持干净
       this.terminalContextSnapshot = this.terminalContext.snapshot(200);
       const envSnapshot = await this.toolExecutor
@@ -205,7 +242,16 @@ export class AgentCore {
         { role: 'user', content: userMessage },
       ];
     } else {
-      // 3. 后续请求：追加新用户消息到已有对话历史
+      // 3. 后续请求：追加新用户消息到已有对话历史，并刷新 system prompt 以同步最新时间与记忆
+      if (this.memoryProvider) {
+        this.unifiedMemory = await this.memoryProvider
+          .fetchUnifiedMemory()
+          .catch(() => this.unifiedMemory);
+      }
+      this.state.messages[0] = {
+        role: 'system',
+        content: this.buildSystemPromptWithSummary(),
+      };
       this.state.messages.push({
         role: 'user',
         content: userMessage,
@@ -228,14 +274,10 @@ export class AgentCore {
     }
   }
 
-  agentAbort(): void {
+  agentAbort(reason: string = 'connection_closed'): void {
+    this.pendingDistillationSnapshot = null;
     if (this.state.status === 'running') {
-      this.abortController.abort('user_stop');
-      this.sendToFrontend({
-        type: 'agent_frame',
-        subType: 'response',
-        content: 'Agent 已停止。',
-      });
+      this.abortController.abort(reason);
       this.state.status = 'idle';
     }
   }
@@ -346,23 +388,9 @@ export class AgentCore {
             });
 
             // Execute tool call
-            let result = await this.toolExecutor.execute(toolCall.function.name, toolArgs, signal);
+            const result = await this.toolExecutor.execute(toolCall.function.name, toolArgs, signal);
             this.recordToolCall(toolCall.function.name, toolArgs);
             this.resetTimeout(); // 看门狗：工具执行成功，重置超时时间
-
-            if (result) {
-              result = result
-                .replace(
-                  /-----BEGIN[A-Z ]+PRIVATE KEY-----[\s\S]+?-----END[A-Z ]+PRIVATE KEY-----/g,
-                  '[REDACTED PRIVATE KEY]'
-                )
-                .replace(
-                  /\bey[a-zA-Z0-9-_=]+\.[a-zA-Z0-9-_=]+\.?[a-zA-Z0-9-_=]*\b/g,
-                  '[REDACTED JWT]'
-                )
-                .replace(/\b(ghp|gho|ghu|ghs|ghr)_[a-zA-Z0-9]{36}\b/g, '[REDACTED GITHUB TOKEN]')
-                .replace(/\b(AKIA[0-9A-Z]{16})\b/g, '[REDACTED AWS KEY ID]');
-            }
 
             // 必须先将 tool 结果加入 messages，否则后续轮次的 LLM 调用会因
             // assistant.tool_calls 缺少对应的 tool 响应而触发 API 400 错误
@@ -402,18 +430,36 @@ export class AgentCore {
           content: choice.message.content || (this.preferredLocale === 'en-US' ? 'Task completed.' : '任务已执行完成。'),
         });
         this.state.status = 'idle';
+        const snapshotMsgs = extractDistillationSnapshot(this.state.messages);
+        const distillPromise = this.triggerMemoryDistillationIfEligible(snapshotMsgs);
+        if (this.waitUntil) {
+          this.waitUntil(distillPromise);
+        }
         return;
       }
 
       // Loop exited — notify frontend of the reason
       if (signal.aborted) {
-        // 超时退出（排除用户手动停止，agentAbort 已自行通知）
-        if (!signal.reason?.includes?.('user_stop')) {
+        // 超时退出时通知前端；会话连接断开时前端已断开无需发送
+        const reasonStr = String(signal.reason || '');
+        if (!reasonStr.includes('connection_closed')) {
           this.sendToFrontend({
             type: 'agent_frame',
             subType: 'response',
             content: `Agent 执行超时（已运行 ${this.state.iteration} 步），已自动停止。请检查终端状态，或发送新消息继续操作。`,
           });
+        }
+      }
+
+      // 迭代上限、超时或连接关闭导致的退出：若已有实质性命令执行，触发阶段性中断记忆提炼
+      const hasExecuted = this.state.iteration > 0 || this.progress.recentToolCalls.length > 0;
+      if (hasExecuted) {
+        const snapshotMsgs = extractDistillationSnapshot(this.state.messages);
+        const distillPromise = this.triggerMemoryDistillationIfEligible(snapshotMsgs, {
+          interrupted: signal.aborted,
+        });
+        if (this.waitUntil) {
+          this.waitUntil(distillPromise);
         }
       }
     } catch (e) {
@@ -695,8 +741,38 @@ export class AgentCore {
     return result;
   }
 
+  /**
+   * 对历史较早轮次的 tool 输出进行轻量压缩，保持单轮与多轮长任务的上下文有界。
+   * 保留最近 6 次工具交互的完整输出；更早的工具消息若超出 300 字符，保留头尾精简概要。
+   * 严格保留 tool_call_id 与消息配对结构，杜绝 API 400。
+   */
+  private compactHistoricalToolOutputs(): void {
+    const toolIndices: number[] = [];
+    for (let i = 1; i < this.state.messages.length; i++) {
+      if (this.state.messages[i].role === 'tool') {
+        toolIndices.push(i);
+      }
+    }
+
+    if (toolIndices.length <= 6) return;
+
+    const toCompactIndices = toolIndices.slice(0, -6);
+    for (const idx of toCompactIndices) {
+      const msg = this.state.messages[idx];
+      if (msg.content && msg.content.length > 300) {
+        const head = msg.content.slice(0, 200);
+        const tail = msg.content.slice(-80);
+        msg.content = `${head}\n[...更早历史执行输出已压缩...]\n${tail}`;
+      }
+    }
+  }
+
   private async trimMessages(): Promise<void> {
     const recentRoundsCount = 8; // 保留 8 轮上下文
+
+    // 1. 无论是多轮还是单轮长任务，对较早累积的 tool 消息进行轻量概要压缩，防爆上下文
+    this.compactHistoricalToolOutputs();
+
     if (this.state.messages.length <= 40) return; // 40 条以内不裁剪（工具结果已在序列化前单独截断）
 
     const conversationMsgs = this.state.messages.slice(1);
@@ -793,7 +869,18 @@ export class AgentCore {
       parts.push(`## 交互式终端最近输出\n${this.terminalContextSnapshot}`);
     }
     if (this.state.summary) {
-      parts.push(`## 之前的对话摘要\n${this.state.summary}`);
+      parts.push(`## 当前会话未决任务与决策摘要\n${this.state.summary}`);
+    }
+    if (this.unifiedMemory.workLogs.length > 0 || this.unifiedMemory.knowledge.length > 0) {
+      const memoryText = formatServerMemoryForPrompt(
+        this.unifiedMemory,
+        this.preferredLocale,
+        Date.now(),
+        this.userTimezone
+      );
+      if (memoryText) {
+        parts.push(memoryText);
+      }
     }
 
     return parts.join('\n\n');
@@ -841,13 +928,13 @@ export class AgentCore {
       ? `\n\n已有摘要（请在其基础上合并新内容，不要丢失已有关键信息）：\n${existingSummary}`
       : '';
 
-    const summaryPrompt = `请将以下运维对话压缩为简洁摘要，保留关键信息：
-- 用户的主要请求和目标
-- 已执行的关键操作和命令
-- 当前状态和未完成的任务
-- AI 提出的建议或需要用户确认的选项
-
-要求：摘要控制在 500 字以内，使用要点列表格式。如有已有摘要，请在其基础上合并新内容，确保不丢失旧摘要中的关键信息。
+    const summaryPrompt = `请将以下运维对话压缩为会话待办与决策上下文摘要，特别关注：
+- 当前正在进行或未完成的运维任务目标
+- 用户明确的偏好选择或已做出的关键决策
+- AI 提出的建议及需要用户后续确认的选项
+- 任何阻碍当前任务的阻塞点或错误结论
+注意：无需罗列琐碎的具体命令执行日志（系统已有独立工作历程记录），专注于保持人机对话的决策连续性与未决状态。
+控制在 300 字以内，使用精炼的要点列表。如有已有摘要，请在其基础上合并新内容，不丢失关键决策。
 
 对话内容：
 ${conversationText}${previousSection}`;
@@ -890,5 +977,196 @@ ${conversationText}${previousSection}`;
     }
 
     return null;
+  }
+
+  private async triggerMemoryDistillationIfEligible(
+    snapshotMsgs: ChatMessage[],
+    options?: { interrupted?: boolean }
+  ): Promise<void> {
+    if (!this.memoryProvider || snapshotMsgs.length < 2 || shouldBypassDistillation(snapshotMsgs)) {
+      return;
+    }
+    if (this.distillationInProgress) {
+      // 正在提炼中：记录最新排队快照，避免多轮连续交互直接丢弃最新结果
+      this.pendingDistillationSnapshot = snapshotMsgs;
+      return;
+    }
+    this.distillationInProgress = true;
+    try {
+      await this.distillMemoryWithLLM(snapshotMsgs, options);
+    } catch {
+      // 提炼失败不得影响正常交互
+    } finally {
+      this.distillationInProgress = false;
+      if (this.pendingDistillationSnapshot) {
+        const nextSnapshot = this.pendingDistillationSnapshot;
+        this.pendingDistillationSnapshot = null;
+        const nextPromise = this.triggerMemoryDistillationIfEligible(nextSnapshot, options);
+        if (this.waitUntil) {
+          this.waitUntil(nextPromise);
+        }
+      }
+    }
+  }
+
+  private async distillMemoryWithLLM(
+    snapshotMsgs: ChatMessage[],
+    options?: { interrupted?: boolean }
+  ): Promise<void> {
+    try {
+      const config = this.agentConfig;
+      if (!config || !this.memoryProvider) return;
+
+      const latestLog = this.unifiedMemory.workLogs?.[0];
+      const isRecentConsecutive = Boolean(
+        latestLog &&
+          typeof latestLog.updated_at === 'number' &&
+          Date.now() - latestLog.updated_at < CONSECUTIVE_TASK_WINDOW_MS
+      );
+
+      // 选取刚才同步快照的消息，并融合已有的近期 WorkLog 与 Knowledge 键值清单
+      const promptInput = formatDistillationPromptInput(
+        snapshotMsgs,
+        this.unifiedMemory.workLogs,
+        this.unifiedMemory.knowledge,
+        {
+          now: Date.now(),
+          locale: this.preferredLocale,
+          timeZone: this.userTimezone,
+        }
+      );
+      if (!promptInput || promptInput.trim().length === 0) return;
+
+      let cleanBaseUrl = config.base_url.replace(/\/$/, '');
+      if (cleanBaseUrl.endsWith('/chat/completions')) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -'/chat/completions'.length);
+      }
+
+      const res = await fetch(`${cleanBaseUrl}/chat/completions`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.api_key}`,
+        },
+        body: JSON.stringify({
+          model: config.model,
+          messages: [
+            { role: 'system', content: MEMORY_DISTILLATION_PROMPT },
+            { role: 'user', content: promptInput },
+          ],
+          max_tokens: 1500,
+          temperature: 0.1,
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+
+      if (res.status >= 300 && res.status < 400) {
+        console.error('SSRF Distillation Fetch Redirect blocked:', res.status);
+        return;
+      }
+
+      if (!res.ok) {
+        console.warn(`Memory distillation HTTP error: ${res.status}`);
+        return;
+      }
+
+      const data = await res.json<{ choices: Array<{ message: { content: string } }> }>();
+      const rawContent = data.choices?.[0]?.message?.content?.trim();
+      if (!rawContent) return;
+
+      const parsed = extractDistillationJson(rawContent);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        console.warn('Memory distillation JSON extraction returned non-object or null');
+        return;
+      }
+
+      let workLogToSave: { mode?: WorkLogMode; title: string; summary: string } | undefined;
+      if (parsed.workLog && typeof parsed.workLog === 'object') {
+        let desiredMode = parsed.workLog.mode;
+        // 容错兜底：若在近期连续会话中且模型未显式输出 mode，默认按 update_latest 合并更新
+        if (!desiredMode && isRecentConsecutive) {
+          desiredMode = 'update_latest';
+        }
+
+        const normLog = normalizeWorkLogInput(
+          {
+            mode: desiredMode,
+            title: parsed.workLog.title,
+            summary: parsed.workLog.summary,
+          },
+          { truncate: true }
+        );
+        if (normLog.ok) {
+          workLogToSave = normLog.value;
+          if (options?.interrupted && workLogToSave) {
+            const prefix = this.preferredLocale === 'en-US' ? '[Interrupted] ' : '[已中断] ';
+            if (
+              !workLogToSave.title.startsWith(prefix) &&
+              !workLogToSave.title.startsWith('[已中断]') &&
+              !workLogToSave.title.startsWith('[Interrupted]')
+            ) {
+              workLogToSave.title = `${prefix}${workLogToSave.title}`.slice(
+                0,
+                WORK_LOG_TITLE_MAX_LENGTH
+              );
+            }
+          }
+        }
+      } else if (options?.interrupted && snapshotMsgs.length >= 2) {
+        // 模型未返回 workLog 时，针对中断会话合成基础留痕，确保断线不丢失上下文
+        const userMsg = snapshotMsgs.find((m) => m.role === 'user')?.content || '运维任务';
+        const truncatedUserMsg = userMsg.slice(0, 30);
+        const prefix = this.preferredLocale === 'en-US' ? '[Interrupted] ' : '[已中断] ';
+        const summary =
+          this.preferredLocale === 'en-US'
+            ? `Task was interrupted after step ${this.state.iteration}.`
+            : `任务在执行第 ${this.state.iteration} 步时被中断或网络断开。`;
+        workLogToSave = {
+          mode: 'create',
+          title: `${prefix}${truncatedUserMsg}`.slice(0, WORK_LOG_TITLE_MAX_LENGTH),
+          summary: summary.slice(0, WORK_LOG_SUMMARY_MAX_LENGTH),
+        };
+      }
+
+      const knowledgeToSave: Array<{
+        action?: KnowledgeAction;
+        category: any;
+        key: string;
+        value: string;
+      }> = [];
+      if (Array.isArray(parsed.knowledge)) {
+        for (const k of parsed.knowledge) {
+          const normK = normalizeKnowledgeInput(
+            {
+              action: k.action,
+              category: k.category,
+              key: k.key,
+              value: k.value,
+            },
+            { truncate: true }
+          );
+          if (normK.ok) {
+            knowledgeToSave.push(normK.value);
+          }
+        }
+      }
+
+      if (workLogToSave || knowledgeToSave.length > 0) {
+        await this.memoryProvider.saveBatchMemory({
+          workLog: workLogToSave,
+          knowledge: knowledgeToSave.length > 0 ? knowledgeToSave : undefined,
+        });
+        this.unifiedMemory = await this.memoryProvider
+          .fetchUnifiedMemory()
+          .catch(() => this.unifiedMemory);
+        this.sendToFrontend({
+          type: 'agent_frame',
+          subType: 'memory_updated',
+        });
+      }
+    } catch (e) {
+      console.warn('Memory distillation failed:', e instanceof Error ? e.message : String(e));
+    }
   }
 }

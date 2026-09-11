@@ -70,6 +70,7 @@ import {
 import { AgentCore } from './agent/core';
 import { AgentExecChannel } from './agent/exec-channel';
 import { TerminalContext } from './agent/terminal-context';
+import type { AgentMemoryProvider, UnifiedServerMemory } from './agent/types';
 import { DirectTcpipStream } from './direct-tcpip-stream';
 import { detectAndPersistRemoteOS } from './os-detect';
 import { SFTPHandler } from './sftp-handler';
@@ -2085,7 +2086,12 @@ export class SSHSession {
         // agent_stop / agent_confirm 已由 durable-object.ts 在 webSocketMessage 入口
         // 提前拦截并通过 handleAgentControl 同步处理，不再到达此处。
         if (parsed.type === 'agent_start') {
-          await this.handleAgentStart(parsed.message, parsed.user_id, parsed.locale);
+          await this.handleAgentStart(
+            parsed.message,
+            parsed.user_id,
+            parsed.locale,
+            parsed.timezone
+          );
           return;
         }
 
@@ -2753,7 +2759,8 @@ export class SSHSession {
   private async handleAgentStart(
     userMessage: string,
     userId?: string,
-    requestedLocale?: string
+    requestedLocale?: string,
+    requestedTimezone?: string
   ): Promise<void> {
     if (this.config.sessionPolicy?.source === 'share') {
       this.sendAgentFrame({
@@ -2799,18 +2806,63 @@ export class SSHSession {
     }
 
     if (!this.agentCore) {
+      let memoryProvider: AgentMemoryProvider | undefined;
+      const serverId = this.config.serverId;
+      const uid = this.userId;
+      const gid = this.githubId;
+      const env = this.env;
+      if (serverId && uid && gid && env) {
+        memoryProvider = {
+          fetchUnifiedMemory: async () => {
+            try {
+              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
+              const res = await stub.fetch(
+                new Request(`http://internal/internal/servers/${serverId}/memory?user_id=${uid}`)
+              );
+              if (!res.ok) return { workLogs: [], knowledge: [] };
+              return (await res.json()) as UnifiedServerMemory;
+            } catch {
+              return { workLogs: [], knowledge: [] };
+            }
+          },
+          saveBatchMemory: async (batch) => {
+            try {
+              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
+              await stub.fetch(
+                new Request(`http://internal/internal/servers/${serverId}/memory/batch`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ user_id: Number(uid), ...batch }),
+                })
+              );
+            } catch {
+              /* ignore */
+            }
+          },
+        };
+      }
+
       this.agentCore = new AgentCore(
         this.terminalContext,
         (msg: any) => this.sendAgentFrame(msg),
-        async (uid: string) => this.fetchAgentAIConfig(uid, this.githubId!),
+        async (uId: string) => this.fetchAgentAIConfig(uId, this.githubId!),
         async (command: string, timeout: number, signal?: AbortSignal) =>
           this.executeAgentCommand(command, timeout, signal),
-        async (command: string, reason: string) => this.askAgentConfirmation(command, reason)
+        async (command: string, reason: string) => this.askAgentConfirmation(command, reason),
+        undefined,
+        memoryProvider,
+        this.waitUntil
       );
     }
 
     const locale = requestedLocale === 'en-US' ? 'en-US' : 'zh-CN';
-    void this.agentCore.handleAgentStart(effectiveUserId, userMessage, locale);
+    const timezone =
+      typeof requestedTimezone === 'string' &&
+      requestedTimezone.length > 0 &&
+      requestedTimezone.length <= 64
+        ? requestedTimezone
+        : undefined;
+    void this.agentCore.handleAgentStart(effectiveUserId, userMessage, locale, timezone);
   }
 
   /**
@@ -2826,7 +2878,7 @@ export class SSHSession {
       return;
     }
     if (type === 'agent_stop') {
-      this.agentCore?.agentAbort();
+      this.agentCore?.agentAbort('connection_closed');
       return;
     }
   }
@@ -3167,7 +3219,7 @@ export class SSHSession {
       this.sftpHandler = null;
     }
     // Cleanup agent
-    this.agentCore?.agentAbort();
+    this.agentCore?.agentAbort('connection_closed');
     this.agentCore = null;
     for (const [, execCh] of this.activeExecChannels) {
       execCh.onClose();

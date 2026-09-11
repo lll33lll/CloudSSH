@@ -2,8 +2,16 @@
 
 import DOMPurify from 'dompurify';
 import { marked, type Tokens } from 'marked';
+import {
+  formatTimestampWithRelative,
+  isSensitiveKeyOrValue,
+  normalizeKnowledgeInput,
+  type ServerKnowledgeItem,
+  type UnifiedServerMemory,
+} from '../../../src/server-memory-schema';
 import { copyTextToClipboard } from '../clipboard';
 import { getLocale, onLocaleChange, t, translateDocument } from '../i18n';
+import { confirmAction, notify } from '../ui-feedback';
 import { getTerminalFillCommand, normalizeCodeLanguage } from './code-actions';
 import {
   buildTerminalSelectionMessage,
@@ -57,6 +65,9 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
+/** 30 分钟断点续接窗口（与服务端 CONSECUTIVE_TASK_WINDOW_MS 连续任务合并窗口严格对齐） */
+const SESSION_DRAFT_TTL_MS = 30 * 60 * 1000;
+
 export class AgentPanel {
   private panelEl: HTMLElement | null = null;
   private messagesEl: HTMLElement | null = null;
@@ -89,10 +100,52 @@ export class AgentPanel {
     previousFocus: HTMLElement | null;
   } | null = null;
 
+  // Unified Server Memory state (Work Logs & Knowledge)
+  private isMemoryDrawerOpen: boolean = false;
+  private activeMemoryTab: 'workLog' | 'knowledge' = 'workLog';
+  private unifiedMemory: UnifiedServerMemory = { workLogs: [], knowledge: [] };
+  private isBatchMode: boolean = false;
+  private selectedKnowledgeIds: Set<number> = new Set();
+  private collapsedDateGroups: Set<string> = new Set(['older']);
+  private memoryDrawerEl: HTMLElement | null = null;
+  private memoryTabWorkLogBtn: HTMLElement | null = null;
+  private memoryTabKnowledgeBtn: HTMLElement | null = null;
+  private memoryContentEl: HTMLElement | null = null;
+  private memoryCountEl: HTMLElement | null = null;
+  private memoryAddBtn: HTMLElement | null = null;
+  private memoryAddFormContainerEl: HTMLElement | null = null;
+  private memoryBatchBtn: HTMLElement | null = null;
+  private memoryBatchBarEl: HTMLElement | null = null;
+  private memorySelectedCountEl: HTMLElement | null = null;
+  private memoryBatchCancelBtn: HTMLButtonElement | null = null;
+  private memoryBatchDeleteBtn: HTMLButtonElement | null = null;
+  private revealedSecretIds: Set<number> = new Set();
+  private sessionMessages: Array<{
+    role: string;
+    content: string;
+    hasTerminalSelection?: boolean;
+  }> = [];
+
   constructor(
     private parentEl: HTMLElement,
-    private isLoggedIn: boolean
+    private isLoggedIn: boolean,
+    private serverId?: number
   ) {}
+
+  setServerId(serverId?: number): void {
+    const prevServerId = this.serverId;
+    this.serverId = serverId;
+    this.revealedSecretIds.clear();
+    this.exitBatchMode();
+    if (prevServerId !== serverId) {
+      this.loadSessionDraft();
+    }
+    if (this.isMemoryDrawerOpen) {
+      void this.fetchServerMemory();
+    } else if (this.isVisible && this.serverId) {
+      void this.fetchServerMemory();
+    }
+  }
 
   setLayoutChangeHandler(handler: () => void): void {
     this.onLayoutChange = handler;
@@ -116,7 +169,7 @@ export class AgentPanel {
     this.panelEl = document.createElement('div');
     this.panelEl.id = 'agent-panel';
     this.panelEl.className =
-      'shrink-0 border-l border-[var(--border)] flex flex-col bg-[var(--bg)] overflow-hidden h-full';
+      'shrink-0 border-l border-[var(--border)] flex flex-col bg-[var(--bg)] overflow-hidden h-full relative';
     this.panelEl.style.width = 'min(clamp(420px, 40vw, 600px), 100%)';
     this.panelEl.style.display = 'none';
 
@@ -127,11 +180,56 @@ export class AgentPanel {
           <span class="material-symbols-outlined text-[var(--accent-secondary)]" style="font-size: 18px; font-variation-settings: 'FILL' 1;">smart_toy</span>
           <span class="text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)] truncate" data-i18n="agent.title">AI Agent 助手</span>
         </div>
-        <button id="agent-close-btn" class="agent-close-button text-muted hover:text-primary transition-colors cursor-pointer p-1" data-i18n-title="agent.backToTerminal" data-i18n-aria-label="agent.backToTerminal" title="返回终端" aria-label="返回终端">
-          <span class="agent-mobile-back material-symbols-outlined" style="font-size:18px;" aria-hidden="true">arrow_back</span>
-          <span class="agent-mobile-back agent-back-label" data-i18n="agent.backToTerminal">返回终端</span>
-          <span class="agent-desktop-close material-symbols-outlined" style="font-size:18px;" aria-hidden="true">close</span>
-        </button>
+        <div class="flex items-center gap-1">
+          <button id="agent-memory-btn" class="agent-header-btn text-muted hover:text-primary transition-colors cursor-pointer p-1 rounded hover:bg-[var(--bg-hover)] flex items-center justify-center" data-i18n-title="agent.memoryTitle" title="工作备忘与记忆" aria-label="工作备忘与记忆">
+            <span class="material-symbols-outlined" style="font-size:18px;" aria-hidden="true">history_edu</span>
+          </button>
+          <button id="agent-close-btn" class="agent-close-button text-muted hover:text-primary transition-colors cursor-pointer p-1" data-i18n-title="agent.backToTerminal" data-i18n-aria-label="agent.backToTerminal" title="返回终端" aria-label="返回终端">
+            <span class="agent-mobile-back material-symbols-outlined" style="font-size:18px;" aria-hidden="true">arrow_back</span>
+            <span class="agent-mobile-back agent-back-label" data-i18n="agent.backToTerminal">返回终端</span>
+            <span class="agent-desktop-close material-symbols-outlined" style="font-size:18px;" aria-hidden="true">close</span>
+          </button>
+        </div>
+      </div>
+      <div id="agent-memory-drawer" class="agent-memory-drawer hidden flex flex-col bg-[var(--bg)] absolute inset-x-0 top-12 bottom-0 z-20 overflow-hidden">
+        <div class="flex items-center justify-between px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-elevated)] shrink-0">
+          <div class="flex items-center gap-1.5 min-w-0">
+            <span class="material-symbols-outlined text-[var(--accent-secondary)]" style="font-size: 16px;">history_edu</span>
+            <span class="text-xs font-bold text-primary truncate" data-i18n="agent.memoryHeader">工作备忘与记忆</span>
+            <span id="agent-memory-count" class="text-[11px] text-muted font-code shrink-0"></span>
+          </div>
+          <div class="flex items-center gap-1 shrink-0">
+            <button id="agent-memory-batch-btn" type="button" class="hidden text-[11px] px-2 py-0.5 rounded border border-outline-variant/60 text-muted hover:text-primary hover:bg-[var(--bg-hover)] transition-colors flex items-center gap-1 cursor-pointer">
+              <span class="material-symbols-outlined text-[13px]">checklist</span>
+              <span id="agent-memory-batch-btn-text" data-i18n="agent.batchManage">批量管理</span>
+            </button>
+            <button id="agent-memory-add-btn" type="button" class="hidden text-[11px] px-2 py-0.5 rounded border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)]/10 transition-colors flex items-center gap-1 cursor-pointer">
+              <span class="material-symbols-outlined text-[13px]">add</span>
+              <span data-i18n="agent.addKnowledge">添加备忘</span>
+            </button>
+            <button id="agent-memory-close-btn" type="button" class="text-muted hover:text-primary p-1 cursor-pointer" data-i18n-title="agent.close" title="关闭">
+              <span class="material-symbols-outlined text-[16px]">close</span>
+            </button>
+          </div>
+        </div>
+        <div class="flex border-b border-[var(--border)] bg-[var(--bg-elevated)]/50 shrink-0 text-xs">
+          <button id="agent-tab-work-log" type="button" class="flex-1 py-1.5 text-center font-medium border-b-2 border-[var(--accent)] text-[var(--accent)] transition-colors cursor-pointer" data-i18n="agent.tabWorkLog">工作历程</button>
+          <button id="agent-tab-knowledge" type="button" class="flex-1 py-1.5 text-center font-medium border-b-2 border-transparent text-muted hover:text-primary transition-colors cursor-pointer" data-i18n="agent.tabKnowledge">知识与凭据</button>
+        </div>
+        <div id="agent-memory-add-form" class="hidden p-3 border-b border-[var(--border)] bg-[var(--bg-elevated)] shrink-0"></div>
+        <div id="agent-memory-content" class="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar text-[12px]"></div>
+        <div id="agent-memory-batch-bar" class="hidden flex items-center justify-between px-3 py-1.5 bg-[var(--bg-elevated)] border-t border-[var(--border)] text-xs shrink-0">
+          <div class="flex items-center gap-2">
+            <span id="agent-memory-selected-count" class="text-primary font-medium text-[11px]">已选择 0 项</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <button id="agent-memory-batch-cancel" type="button" class="px-2 py-0.5 rounded text-muted hover:text-primary hover:bg-[var(--bg-hover)] cursor-pointer text-[11px]" data-i18n="agent.batchCancel">退出管理</button>
+            <button id="agent-memory-batch-delete" type="button" class="px-2.5 py-0.5 rounded bg-error/15 text-error hover:bg-error/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors font-medium flex items-center gap-1 cursor-pointer text-[11px]" disabled>
+              <span class="material-symbols-outlined text-[13px]">delete</span>
+              <span data-i18n="agent.batchDelete">批量删除</span>
+            </button>
+          </div>
+        </div>
       </div>
       <div id="agent-messages" class="flex-1 overflow-y-auto px-4 py-3 space-y-3 custom-scrollbar text-[13px]"></div>
       <div class="agent-panel-composer px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-elevated)]">
@@ -171,6 +269,9 @@ export class AgentPanel {
       this.updateInputState();
       this.renderTerminalSelectionContext();
       this.refreshCodeBlockActions();
+      if (this.isMemoryDrawerOpen) {
+        this.renderMemoryContent();
+      }
     });
 
     this.parentEl.appendChild(this.panelEl);
@@ -178,12 +279,35 @@ export class AgentPanel {
     this.contextEl = this.panelEl.querySelector('#agent-context');
     this.inputEl = this.panelEl.querySelector('#agent-input') as HTMLTextAreaElement;
     this.sendBtn = this.panelEl.querySelector('#agent-send-btn');
+    this.memoryDrawerEl = this.panelEl.querySelector('#agent-memory-drawer');
+    this.memoryTabWorkLogBtn = this.panelEl.querySelector('#agent-tab-work-log');
+    this.memoryTabKnowledgeBtn = this.panelEl.querySelector('#agent-tab-knowledge');
+    this.memoryContentEl = this.panelEl.querySelector('#agent-memory-content');
+    this.memoryCountEl = this.panelEl.querySelector('#agent-memory-count');
+    this.memoryAddBtn = this.panelEl.querySelector('#agent-memory-add-btn');
+    this.memoryAddFormContainerEl = this.panelEl.querySelector('#agent-memory-add-form');
+    this.memoryBatchBtn = this.panelEl.querySelector('#agent-memory-batch-btn');
+    this.memoryBatchBarEl = this.panelEl.querySelector('#agent-memory-batch-bar');
+    this.memorySelectedCountEl = this.panelEl.querySelector('#agent-memory-selected-count');
+    this.memoryBatchCancelBtn = this.panelEl.querySelector('#agent-memory-batch-cancel');
+    this.memoryBatchDeleteBtn = this.panelEl.querySelector('#agent-memory-batch-delete');
     this.bindEvents();
     this.updateInputState();
+    if (this.serverId) {
+      this.loadSessionDraft();
+    }
   }
 
   private bindEvents(): void {
     this.panelEl?.querySelector('#agent-close-btn')?.addEventListener('click', () => this.hide());
+    this.panelEl?.querySelector('#agent-memory-btn')?.addEventListener('click', () => this.toggleMemoryDrawer());
+    this.panelEl?.querySelector('#agent-memory-close-btn')?.addEventListener('click', () => this.closeMemoryDrawer());
+    this.memoryTabWorkLogBtn?.addEventListener('click', () => this.switchMemoryTab('workLog'));
+    this.memoryTabKnowledgeBtn?.addEventListener('click', () => this.switchMemoryTab('knowledge'));
+    this.memoryAddBtn?.addEventListener('click', () => this.toggleAddKnowledgeForm());
+    this.memoryBatchBtn?.addEventListener('click', () => this.toggleBatchMode());
+    this.memoryBatchCancelBtn?.addEventListener('click', () => this.exitBatchMode());
+    this.memoryBatchDeleteBtn?.addEventListener('click', () => void this.handleBatchDelete());
 
     this.panelEl?.querySelectorAll('.agent-quick-chip').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -210,6 +334,10 @@ export class AgentPanel {
     this.panelEl?.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         e.preventDefault();
+        if (this.isMemoryDrawerOpen) {
+          this.closeMemoryDrawer();
+          return;
+        }
         this.hide();
       }
     });
@@ -236,6 +364,7 @@ export class AgentPanel {
     if (this.panelEl) this.panelEl.style.display = 'flex';
     document.body.classList.add('agent-panel-open');
     this.inputEl?.focus();
+    if (this.serverId) void this.fetchServerMemory();
     // 触发终端重新适配（面板展开后终端区域缩小，需要 refit）
     requestAnimationFrame(() => this.onLayoutChange?.());
   }
@@ -305,10 +434,19 @@ export class AgentPanel {
       case 'progress_extend':
         this.showProgressExtend(msg.message, msg.currentIteration, msg.newMax, msg.reason);
         break;
+      case 'memory_updated':
+        this.clearSessionDraft();
+        if (this.serverId) {
+          void this.fetchServerMemory();
+        }
+        break;
     }
   }
 
   private handleSend(): void {
+    if (this.isMemoryDrawerOpen) {
+      this.closeMemoryDrawer();
+    }
     const text = this.inputEl?.value || '';
     const selection = this.pendingTerminalSelection;
     if (!this.sendMessage(text, selection)) return;
@@ -340,11 +478,13 @@ export class AgentPanel {
     this.isAgentRunning = true;
     this.updateInputState();
 
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     this.wsSend?.(
       JSON.stringify({
         type: 'agent_start',
         message: outboundMessage,
         locale: getLocale(),
+        timezone,
       })
     );
     return true;
@@ -362,6 +502,9 @@ export class AgentPanel {
   }
 
   private addUserMessage(text: string, hasTerminalSelection = false): void {
+    this.removeResumeChip();
+    this.sessionMessages.push({ role: 'user', content: text, hasTerminalSelection });
+    this.saveSessionDraft(true);
     this.appendMessage('user', text, { hasTerminalSelection });
   }
 
@@ -591,6 +734,8 @@ export class AgentPanel {
 
   private addAgentResponse(content: string): void {
     this.collapseThinkingProcess();
+    this.sessionMessages.push({ role: 'response', content: content || '' });
+    this.saveSessionDraft(false);
     this.appendMessage('response', content || '');
   }
 
@@ -649,6 +794,8 @@ export class AgentPanel {
         contentEl.innerHTML = inner ? inner.innerHTML : content || this.streamingText || '';
         this.enhanceCodeBlocks(contentEl);
       }
+      this.sessionMessages.push({ role: 'response', content: content || this.streamingText || '' });
+      this.saveSessionDraft(false);
       this.streamingEl = null;
       this.streamingText = '';
     } else {
@@ -664,6 +811,8 @@ export class AgentPanel {
       this.streamingText = '';
     }
     this.collapseThinkingProcess();
+    this.sessionMessages.push({ role: 'error', content: message || t('feedback.danger') });
+    this.saveSessionDraft(false);
     this.appendMessage('error', message || t('feedback.danger'));
   }
 
@@ -958,15 +1107,15 @@ export class AgentPanel {
       if (copyButton) this.setCodeActionButton(copyButton, 'content_copy', t('agent.codeCopy'));
 
       const fillButton = block.querySelector<HTMLButtonElement>('[data-code-action="fill"]');
-      if (!fillButton) return;
-      this.setCodeActionButton(fillButton, 'input', t('agent.codeFill'));
-
-      const target = this.getTerminalFillTarget?.();
-      fillButton.disabled = !target?.available;
-      const metaEl = block.querySelector<HTMLElement>('.agent-md-code-meta');
-      if (metaEl && target) {
-        metaEl.textContent = t('agent.codeTarget', { target: target.label });
-        metaEl.title = target.label;
+      if (fillButton) {
+        this.setCodeActionButton(fillButton, 'input', t('agent.codeFill'));
+        const target = this.getTerminalFillTarget?.();
+        fillButton.disabled = !target?.available;
+        const metaEl = block.querySelector<HTMLElement>('.agent-md-code-meta');
+        if (metaEl && target) {
+          metaEl.textContent = t('agent.codeTarget', { target: target.label });
+          metaEl.title = target.label;
+        }
       }
     });
   }
@@ -1018,6 +1167,84 @@ export class AgentPanel {
     }
   }
 
+  private renderResumeChip(): void {
+    const chipsContainer = this.panelEl?.querySelector('#agent-quick-chips');
+    if (!chipsContainer || chipsContainer.querySelector('#agent-resume-task-chip')) return;
+
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.id = 'agent-resume-task-chip';
+    chip.className =
+      'agent-quick-chip shrink-0 text-[11px] px-2.5 py-0.5 rounded border border-warning/60 hover:border-warning text-warning hover:text-primary transition-colors cursor-pointer flex items-center gap-1 bg-warning/10 font-medium';
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    chip.innerHTML = `
+      <span class="material-symbols-outlined text-[13px]">play_circle</span>
+      <span data-i18n="agent.resumeInterruptedTask">${escapeHtml(t('agent.resumeInterruptedTask'))}</span>
+    `;
+    chip.addEventListener('click', () => {
+      chip.remove();
+      this.sendMessage(t('agent.resumePrompt'));
+    });
+    chipsContainer.prepend(chip);
+  }
+
+  private removeResumeChip(): void {
+    this.panelEl?.querySelector('#agent-resume-task-chip')?.remove();
+  }
+
+  private loadSessionDraft(): void {
+    if (!this.serverId || !this.messagesEl) return;
+    try {
+      const raw = localStorage.getItem(`cloudssh_agent_draft_${this.serverId}`);
+      if (!raw) return;
+      const draft = JSON.parse(raw);
+      if (!draft || !Array.isArray(draft.messages) || draft.messages.length === 0) return;
+      // 仅恢复 30 分钟内的中断会话；已完成或过期会话立即清理，避免与云端提炼记忆重复
+      if (
+        !draft.wasInterrupted ||
+        Date.now() - Number(draft.updatedAt || 0) > SESSION_DRAFT_TTL_MS
+      ) {
+        localStorage.removeItem(`cloudssh_agent_draft_${this.serverId}`);
+        return;
+      }
+      this.sessionMessages = [...draft.messages];
+      this.messagesEl.innerHTML = '';
+      for (const m of this.sessionMessages) {
+        this.appendMessage(m.role, m.content, { hasTerminalSelection: m.hasTerminalSelection });
+      }
+      this.renderResumeChip();
+    } catch {
+      /* ignore corrupted draft */
+    }
+  }
+
+  private saveSessionDraft(isInterrupted: boolean): void {
+    if (!this.serverId) return;
+    // 任务正常完成或无消息时，立即删除本地暂存草稿，由云端记忆（WorkLog & Knowledge）全权接管
+    if (!isInterrupted || this.sessionMessages.length === 0) {
+      localStorage.removeItem(`cloudssh_agent_draft_${this.serverId}`);
+      return;
+    }
+    try {
+      const draft = {
+        serverId: this.serverId,
+        updatedAt: Date.now(),
+        messages: this.sessionMessages.slice(-20),
+        wasInterrupted: true,
+      };
+      localStorage.setItem(`cloudssh_agent_draft_${this.serverId}`, JSON.stringify(draft));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private clearSessionDraft(): void {
+    if (this.serverId) {
+      localStorage.removeItem(`cloudssh_agent_draft_${this.serverId}`);
+    }
+    this.removeResumeChip();
+  }
+
   dispose(): void {
     this.rejectPendingConfirmation(false);
     this.localeCleanup?.();
@@ -1029,7 +1256,594 @@ export class AgentPanel {
     this.contextEl = null;
     this.inputEl = null;
     this.sendBtn = null;
+    this.memoryDrawerEl = null;
+    this.memoryTabWorkLogBtn = null;
+    this.memoryTabKnowledgeBtn = null;
+    this.memoryContentEl = null;
+    this.memoryCountEl = null;
+    this.memoryAddBtn = null;
+    this.memoryAddFormContainerEl = null;
+    this.memoryBatchBtn = null;
+    this.memoryBatchBarEl = null;
+    this.memorySelectedCountEl = null;
+    this.memoryBatchCancelBtn = null;
+    this.memoryBatchDeleteBtn = null;
     this.isVisible = false;
     document.body.classList.remove('agent-panel-open');
+  }
+
+  // ==================== Server Unified Memory Management ====================
+
+  toggleMemoryDrawer(): void {
+    if (this.isMemoryDrawerOpen) {
+      this.closeMemoryDrawer();
+    } else {
+      this.openMemoryDrawer();
+    }
+  }
+
+  openMemoryDrawer(): void {
+    this.isMemoryDrawerOpen = true;
+    if (this.memoryDrawerEl) {
+      this.memoryDrawerEl.classList.remove('hidden');
+    }
+    void this.fetchServerMemory();
+  }
+
+  closeMemoryDrawer(): void {
+    this.isMemoryDrawerOpen = false;
+    if (this.memoryDrawerEl) {
+      this.memoryDrawerEl.classList.add('hidden');
+    }
+    this.exitBatchMode();
+    this.closeAddKnowledgeForm();
+  }
+
+  switchMemoryTab(tab: 'workLog' | 'knowledge'): void {
+    this.activeMemoryTab = tab;
+    this.exitBatchMode();
+    if (this.memoryTabWorkLogBtn && this.memoryTabKnowledgeBtn) {
+      if (tab === 'workLog') {
+        this.memoryTabWorkLogBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-[var(--accent)] text-[var(--accent)] transition-colors cursor-pointer';
+        this.memoryTabKnowledgeBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-transparent text-muted hover:text-primary transition-colors cursor-pointer';
+        this.memoryAddBtn?.classList.add('hidden');
+        this.memoryBatchBtn?.classList.add('hidden');
+      } else {
+        this.memoryTabWorkLogBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-transparent text-muted hover:text-primary transition-colors cursor-pointer';
+        this.memoryTabKnowledgeBtn.className =
+          'flex-1 py-1.5 text-center font-medium border-b-2 border-[var(--accent)] text-[var(--accent)] transition-colors cursor-pointer';
+        this.memoryAddBtn?.classList.remove('hidden');
+        if (this.unifiedMemory.knowledge.length > 0 && this.serverId && this.isLoggedIn) {
+          this.memoryBatchBtn?.classList.remove('hidden');
+        } else {
+          this.memoryBatchBtn?.classList.add('hidden');
+        }
+      }
+    }
+    this.closeAddKnowledgeForm();
+    this.renderMemoryContent();
+  }
+
+  toggleBatchMode(): void {
+    if (this.isBatchMode) {
+      this.exitBatchMode();
+    } else {
+      this.enterBatchMode();
+    }
+  }
+
+  private enterBatchMode(): void {
+    this.isBatchMode = true;
+    this.selectedKnowledgeIds.clear();
+    this.memoryBatchBarEl?.classList.remove('hidden');
+    const textEl = this.panelEl?.querySelector('#agent-memory-batch-btn-text');
+    if (textEl) textEl.textContent = t('agent.batchCancel');
+    this.updateBatchBar();
+    this.renderMemoryContent();
+  }
+
+  exitBatchMode(): void {
+    if (!this.isBatchMode) return;
+    this.isBatchMode = false;
+    this.selectedKnowledgeIds.clear();
+    this.memoryBatchBarEl?.classList.add('hidden');
+    const textEl = this.panelEl?.querySelector('#agent-memory-batch-btn-text');
+    if (textEl) textEl.textContent = t('agent.batchManage');
+    this.renderMemoryContent();
+  }
+
+  private updateBatchBar(): void {
+    if (this.memorySelectedCountEl) {
+      this.memorySelectedCountEl.textContent = t('agent.selectedCount', {
+        count: this.selectedKnowledgeIds.size,
+      });
+    }
+    if (this.memoryBatchDeleteBtn) {
+      this.memoryBatchDeleteBtn.disabled = this.selectedKnowledgeIds.size === 0;
+    }
+  }
+
+  private async handleBatchDelete(): Promise<void> {
+    if (this.selectedKnowledgeIds.size === 0 || !this.serverId) return;
+    const count = this.selectedKnowledgeIds.size;
+    const ok = await confirmAction({
+      title: t('agent.batchDelete'),
+      message: t('agent.batchDeleteConfirm', { count }),
+      variant: 'danger',
+    });
+    if (!ok) return;
+
+    try {
+      const ids = Array.from(this.selectedKnowledgeIds);
+      const res = await fetch(`/api/servers/${this.serverId}/knowledge/batch`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (res.ok) {
+        notify(t('agent.batchDeleteSuccess', { count }), { variant: 'success' });
+        this.exitBatchMode();
+        void this.fetchServerMemory();
+      } else {
+        const err = await res.json().catch(() => ({ error: 'Failed to delete' }));
+        notify((err as any).error || 'Failed to delete', { variant: 'danger' });
+      }
+    } catch {
+      notify('Failed to delete', { variant: 'danger' });
+    }
+  }
+
+  private groupKnowledgeByDate(items: ServerKnowledgeItem[]): Array<{
+    key: 'today' | 'yesterday' | 'older';
+    label: string;
+    items: ServerKnowledgeItem[];
+  }> {
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const yesterdayStart = todayStart - 24 * 60 * 60 * 1000;
+
+    const todayItems: ServerKnowledgeItem[] = [];
+    const yesterdayItems: ServerKnowledgeItem[] = [];
+    const olderItems: ServerKnowledgeItem[] = [];
+
+    for (const item of items) {
+      const ts = item.updated_at || item.created_at;
+      if (ts >= todayStart) {
+        todayItems.push(item);
+      } else if (ts >= yesterdayStart) {
+        yesterdayItems.push(item);
+      } else {
+        olderItems.push(item);
+      }
+    }
+
+    const groups: Array<{
+      key: 'today' | 'yesterday' | 'older';
+      label: string;
+      items: ServerKnowledgeItem[];
+    }> = [];
+    if (todayItems.length > 0) {
+      groups.push({ key: 'today', label: t('agent.dateGroupToday'), items: todayItems });
+    }
+    if (yesterdayItems.length > 0) {
+      groups.push({ key: 'yesterday', label: t('agent.dateGroupYesterday'), items: yesterdayItems });
+    }
+    if (olderItems.length > 0) {
+      groups.push({ key: 'older', label: t('agent.dateGroupOlder'), items: olderItems });
+    }
+    return groups;
+  }
+
+  private async fetchServerMemory(): Promise<void> {
+    if (!this.serverId) {
+      this.unifiedMemory = { workLogs: [], knowledge: [] };
+      this.renderMemoryContent();
+      return;
+    }
+    try {
+      const res = await fetch(`/api/servers/${this.serverId}/memory`);
+      if (res.ok) {
+        this.unifiedMemory = (await res.json()) as UnifiedServerMemory;
+      } else {
+        this.unifiedMemory = { workLogs: [], knowledge: [] };
+      }
+    } catch {
+      this.unifiedMemory = { workLogs: [], knowledge: [] };
+    }
+    this.renderMemoryContent();
+  }
+
+  private renderMemoryContent(): void {
+    if (!this.memoryContentEl) return;
+    const locale = getLocale() === 'en-US' ? 'en-US' : 'zh-CN';
+
+    if (this.memoryCountEl) {
+      if (this.activeMemoryTab === 'workLog') {
+        this.memoryCountEl.textContent = this.serverId
+          ? `(${this.unifiedMemory.workLogs.length})`
+          : '';
+      } else {
+        this.memoryCountEl.textContent = this.serverId
+          ? `(${this.unifiedMemory.knowledge.length})`
+          : '';
+      }
+    }
+
+    if (!this.serverId) {
+      // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+      this.memoryContentEl.innerHTML = `
+        <div class="p-4 text-center text-muted text-xs">
+          ${t('agent.memoryDirectNotice')}
+        </div>
+      `;
+      return;
+    }
+
+    const userTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+    if (this.activeMemoryTab === 'workLog') {
+      if (this.unifiedMemory.workLogs.length === 0) {
+        // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+        this.memoryContentEl.innerHTML = `
+          <div class="p-4 text-center text-muted text-xs">
+            ${t('agent.workLogEmpty')}
+          </div>
+        `;
+        return;
+      }
+
+      const logsHtml = this.unifiedMemory.workLogs
+        .map((log) => {
+          const timeStr = formatTimestampWithRelative(log.created_at, Date.now(), locale, userTz);
+          return `
+            <div class="agent-memory-card p-2.5 rounded border border-[var(--border)] bg-[var(--bg-elevated)] flex flex-col gap-1.5" data-log-id="${log.id}">
+              <div class="flex items-center justify-between text-[11px]">
+                <div class="flex items-center gap-1.5 min-w-0">
+                  <span class="font-bold text-primary truncate" title="${escapeHtml(log.title)}">${escapeHtml(log.title)}</span>
+                  <span class="text-[10px] text-muted font-code shrink-0">${escapeHtml(timeStr)}</span>
+                </div>
+                <button type="button" class="agent-log-delete-btn text-muted hover:text-error transition-colors p-0.5 cursor-pointer shrink-0" data-id="${log.id}" title="${t('common.delete')}">
+                  <span class="material-symbols-outlined text-[15px]">delete</span>
+                </button>
+              </div>
+              <div class="agent-log-summary text-[11px] text-muted leading-relaxed cursor-pointer hover:text-text transition-colors select-text" title="${escapeHtml(log.summary)}">${escapeHtml(log.summary)}</div>
+            </div>
+          `;
+        })
+        .join('');
+
+      // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+      this.memoryContentEl.innerHTML = logsHtml;
+
+      this.memoryContentEl.querySelectorAll<HTMLElement>('.agent-log-summary').forEach((el) => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          el.classList.toggle('expanded');
+        });
+      });
+
+      this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-log-delete-btn').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const logId = Number(btn.dataset.id);
+          if (!logId || !this.serverId) return;
+          const ok = await confirmAction({
+            title: t('common.delete'),
+            message: t('agent.memoryDeleteConfirm'),
+            variant: 'danger',
+          });
+          if (!ok) return;
+
+          try {
+            const res = await fetch(`/api/servers/${this.serverId}/work-logs/${logId}`, {
+              method: 'DELETE',
+            });
+            if (res.ok) {
+              notify(t('agent.memoryDeleted'), { variant: 'success' });
+              void this.fetchServerMemory();
+            }
+          } catch {
+            /* ignore */
+          }
+        });
+      });
+      return;
+    }
+
+    // Knowledge Tab
+    if (this.unifiedMemory.knowledge.length === 0) {
+      this.memoryBatchBtn?.classList.add('hidden');
+      this.exitBatchMode();
+      // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+      this.memoryContentEl.innerHTML = `
+        <div class="p-4 text-center text-muted text-xs">
+          ${t('agent.knowledgeEmpty')}
+        </div>
+      `;
+      return;
+    }
+
+    if (this.serverId && this.isLoggedIn) {
+      this.memoryBatchBtn?.classList.remove('hidden');
+    }
+
+    const catBadges: Record<string, { label: string; tagClass: string }> = {
+      credential: {
+        label: t('agent.categoryCredential'),
+        tagClass: 'bg-amber-500/15 text-amber-400',
+      },
+      config: {
+        label: t('agent.categoryConfig'),
+        tagClass: 'bg-[var(--accent)]/15 text-[var(--accent)]',
+      },
+      rule: {
+        label: t('agent.categoryRule'),
+        tagClass: 'bg-[var(--accent-secondary)]/15 text-[var(--accent-secondary)]',
+      },
+      note: {
+        label: t('agent.categoryNote'),
+        tagClass: 'bg-emerald-500/15 text-emerald-400',
+      },
+    };
+
+    const groups = this.groupKnowledgeByDate(this.unifiedMemory.knowledge);
+    const groupsHtml = groups
+      .map((g) => {
+        const isCollapsed = this.collapsedDateGroups.has(g.key);
+        const isAllGroupSelected =
+          g.items.length > 0 && g.items.every((item) => this.selectedKnowledgeIds.has(item.id));
+
+        const itemsHtml = g.items
+          .map((k) => {
+            const meta = catBadges[k.category] || catBadges.note;
+            const isSecret = k.category === 'credential' || isSensitiveKeyOrValue(k.key, k.value);
+            const isRevealed = this.revealedSecretIds.has(k.id);
+            const displayValue = isSecret && !isRevealed ? '••••••••••••••••' : k.value;
+            const isSelected = this.selectedKnowledgeIds.has(k.id);
+
+            return `
+              <div class="agent-knowledge-item group px-3 py-2 flex items-center justify-between gap-2 text-[12px] hover:bg-[var(--bg-hover)]/40 transition-colors select-text" data-knowledge-id="${k.id}">
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                  ${
+                    this.isBatchMode
+                      ? `<input type="checkbox" class="agent-knowledge-check rounded cursor-pointer shrink-0 accent-[var(--accent)]" data-id="${k.id}" ${isSelected ? 'checked' : ''} />`
+                      : ''
+                  }
+                  <span class="px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase shrink-0 ${meta.tagClass}">${escapeHtml(meta.label)}</span>
+                  <span class="font-mono font-semibold text-primary shrink-0 select-all">${escapeHtml(k.key)}:</span>
+                  <span class="font-mono text-muted group-hover:text-primary transition-colors truncate select-all flex-1 min-w-0" title="${escapeHtml(k.value)}">${escapeHtml(displayValue)}</span>
+                </div>
+                <div class="flex items-center gap-0.5 shrink-0">
+                  ${
+                    isSecret
+                      ? `
+                    <button type="button" class="agent-secret-toggle-btn text-muted hover:text-primary transition-colors p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer flex items-center justify-center" data-id="${k.id}" title="${isRevealed ? t('agent.hideSecret') : t('agent.revealSecret')}">
+                      <span class="material-symbols-outlined text-[15px]">${isRevealed ? 'visibility_off' : 'visibility'}</span>
+                    </button>
+                  `
+                      : ''
+                  }
+                  <button type="button" class="agent-knowledge-copy-btn text-muted hover:text-primary transition-colors p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer flex items-center justify-center" data-value="${escapeHtml(k.value)}" title="${t('agent.codeCopy')}">
+                    <span class="material-symbols-outlined text-[15px]">content_copy</span>
+                  </button>
+                  ${
+                    !this.isBatchMode
+                      ? `
+                    <button type="button" class="agent-knowledge-delete-btn text-muted hover:text-error transition-colors p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer flex items-center justify-center" data-id="${k.id}" title="${t('common.delete')}">
+                      <span class="material-symbols-outlined text-[15px]">delete</span>
+                    </button>
+                  `
+                      : ''
+                  }
+                </div>
+              </div>
+            `;
+          })
+          .join('');
+
+        return `
+          <div class="agent-knowledge-group border border-[var(--border)] rounded-lg overflow-hidden bg-[var(--bg-elevated)]/30" data-group-key="${g.key}">
+            <div class="agent-knowledge-group-header flex items-center justify-between px-3 py-1.5 bg-[var(--bg-elevated)]/70 cursor-pointer select-none hover:bg-[var(--bg-hover)]/40 transition-colors" data-group="${g.key}">
+              <div class="flex items-center gap-1.5 text-xs font-semibold text-primary">
+                <span class="material-symbols-outlined text-[16px] transition-transform duration-200 ${isCollapsed ? '-rotate-90' : ''}">expand_more</span>
+                <span>${escapeHtml(g.label)}</span>
+                <span class="text-[11px] font-normal text-muted">(${g.items.length})</span>
+              </div>
+              ${
+                this.isBatchMode
+                  ? `
+                <button type="button" class="agent-group-select-all text-[11px] text-[var(--accent)] hover:underline cursor-pointer" data-group="${g.key}">
+                  ${isAllGroupSelected ? t('agent.deselectGroup') : t('agent.selectGroup')}
+                </button>
+              `
+                  : ''
+              }
+            </div>
+            <div class="agent-knowledge-group-items divide-y divide-[var(--border)]/30 ${isCollapsed ? 'hidden' : ''}">
+              ${itemsHtml}
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    this.memoryContentEl.innerHTML = groupsHtml;
+
+    this.memoryContentEl.querySelectorAll<HTMLElement>('.agent-knowledge-group-header').forEach((hdr) => {
+      hdr.addEventListener('click', (e) => {
+        const target = e.target as HTMLElement;
+        if (target.closest('.agent-group-select-all')) return;
+        const groupKey = hdr.dataset.group;
+        if (!groupKey) return;
+        if (this.collapsedDateGroups.has(groupKey)) {
+          this.collapsedDateGroups.delete(groupKey);
+        } else {
+          this.collapsedDateGroups.add(groupKey);
+        }
+        this.renderMemoryContent();
+      });
+    });
+
+    this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-group-select-all').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const groupKey = btn.dataset.group;
+        const group = groups.find((g) => g.key === groupKey);
+        if (!group) return;
+        const allSelected = group.items.every((k) => this.selectedKnowledgeIds.has(k.id));
+        if (allSelected) {
+          for (const k of group.items) this.selectedKnowledgeIds.delete(k.id);
+        } else {
+          for (const k of group.items) this.selectedKnowledgeIds.add(k.id);
+        }
+        this.updateBatchBar();
+        this.renderMemoryContent();
+      });
+    });
+
+    this.memoryContentEl.querySelectorAll<HTMLInputElement>('.agent-knowledge-check').forEach((chk) => {
+      chk.addEventListener('change', (e) => {
+        e.stopPropagation();
+        const kId = Number(chk.dataset.id);
+        if (chk.checked) {
+          this.selectedKnowledgeIds.add(kId);
+        } else {
+          this.selectedKnowledgeIds.delete(kId);
+        }
+        this.updateBatchBar();
+      });
+    });
+
+    this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-secret-toggle-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const kId = Number(btn.dataset.id);
+        if (this.revealedSecretIds.has(kId)) {
+          this.revealedSecretIds.delete(kId);
+        } else {
+          this.revealedSecretIds.add(kId);
+        }
+        this.renderMemoryContent();
+      });
+    });
+
+    this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-knowledge-copy-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const val = btn.dataset.value || '';
+        await copyTextToClipboard(val);
+        notify(t('agent.copySuccess'), { variant: 'success' });
+      });
+    });
+
+    this.memoryContentEl.querySelectorAll<HTMLButtonElement>('.agent-knowledge-delete-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const kId = Number(btn.dataset.id);
+        if (!kId || !this.serverId) return;
+        const ok = await confirmAction({
+          title: t('common.delete'),
+          message: t('agent.memoryDeleteConfirm'),
+          variant: 'danger',
+        });
+        if (!ok) return;
+
+        try {
+          const res = await fetch(`/api/servers/${this.serverId}/knowledge/${kId}`, {
+            method: 'DELETE',
+          });
+          if (res.ok) {
+            notify(t('agent.memoryDeleted'), { variant: 'success' });
+            void this.fetchServerMemory();
+          }
+        } catch {
+          /* ignore */
+        }
+      });
+    });
+  }
+
+  toggleAddKnowledgeForm(): void {
+    if (!this.memoryAddFormContainerEl) return;
+    if (this.memoryAddFormContainerEl.classList.contains('hidden')) {
+      this.openAddKnowledgeForm();
+    } else {
+      this.closeAddKnowledgeForm();
+    }
+  }
+
+  openAddKnowledgeForm(): void {
+    if (!this.memoryAddFormContainerEl) return;
+    this.memoryAddFormContainerEl.classList.remove('hidden');
+
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    this.memoryAddFormContainerEl.innerHTML = `
+      <form id="agent-add-knowledge-form" class="space-y-2">
+        <div class="flex gap-2">
+          <select id="agent-knowledge-category" class="terminal-input text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] text-primary">
+            <option value="credential">${t('agent.categoryCredential')}</option>
+            <option value="config">${t('agent.categoryConfig')}</option>
+            <option value="rule">${t('agent.categoryRule')}</option>
+            <option value="note" selected>${t('agent.categoryNote')}</option>
+          </select>
+          <input id="agent-knowledge-key" type="text" placeholder="${t('agent.knowledgeKey')}" class="terminal-input flex-1 text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code text-primary" required maxlength="64" />
+        </div>
+        <div>
+          <textarea id="agent-knowledge-value" rows="2" placeholder="${t('agent.knowledgeValue')}" class="terminal-input w-full text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code resize-none text-primary" required maxlength="512"></textarea>
+        </div>
+        <div class="flex justify-end gap-2">
+          <button type="button" id="agent-knowledge-cancel-btn" class="px-2 py-0.5 text-xs text-muted hover:text-primary cursor-pointer">${t('agent.memoryCancel')}</button>
+          <button type="submit" id="agent-knowledge-submit-btn" class="cyber-button px-3 py-0.5 text-xs font-bold text-white bg-[var(--accent)] cursor-pointer">${t('agent.memorySave')}</button>
+        </div>
+      </form>
+    `;
+
+    const form = this.memoryAddFormContainerEl.querySelector<HTMLFormElement>('#agent-add-knowledge-form');
+    const cancelBtn = this.memoryAddFormContainerEl.querySelector<HTMLButtonElement>('#agent-knowledge-cancel-btn');
+    cancelBtn?.addEventListener('click', () => this.closeAddKnowledgeForm());
+
+    form?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await this.handleSaveKnowledge();
+    });
+
+    const keyInput = this.memoryAddFormContainerEl.querySelector<HTMLInputElement>('#agent-knowledge-key');
+    keyInput?.focus();
+  }
+
+  closeAddKnowledgeForm(): void {
+    if (!this.memoryAddFormContainerEl) return;
+    this.memoryAddFormContainerEl.classList.add('hidden');
+    this.memoryAddFormContainerEl.replaceChildren();
+  }
+
+  private async handleSaveKnowledge(): Promise<void> {
+    if (!this.serverId || !this.memoryAddFormContainerEl) return;
+    const catSelect = this.memoryAddFormContainerEl.querySelector<HTMLSelectElement>('#agent-knowledge-category');
+    const keyInput = this.memoryAddFormContainerEl.querySelector<HTMLInputElement>('#agent-knowledge-key');
+    const valInput = this.memoryAddFormContainerEl.querySelector<HTMLTextAreaElement>('#agent-knowledge-value');
+
+    const category = catSelect?.value || 'note';
+    const key = keyInput?.value || '';
+    const value = valInput?.value || '';
+
+    const normalized = normalizeKnowledgeInput({ category, key, value });
+    if (!normalized.ok) return;
+
+    try {
+      const res = await fetch(`/api/servers/${this.serverId}/knowledge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(normalized.value),
+      });
+
+      if (res.ok) {
+        notify(t('agent.memorySaved'), { variant: 'success' });
+        this.closeAddKnowledgeForm();
+        void this.fetchServerMemory();
+      }
+    } catch {
+      /* ignore */
+    }
   }
 }
