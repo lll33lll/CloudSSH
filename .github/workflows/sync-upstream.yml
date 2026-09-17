@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: sync-upstream-main
@@ -25,6 +26,7 @@ jobs:
 
     steps:
       - name: Sync main branch from upstream
+        id: sync
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
@@ -77,6 +79,12 @@ jobs:
               ;;
           esac
 
+          if [[ "$merge_type" == "none" ]]; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
           echo "上游分支：${base_branch}"
           echo "同步结果：${result}"
           if [[ -n "$detail" ]]; then
@@ -93,3 +101,12 @@ jobs:
               echo "- ${detail}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Trigger deploy
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run auto-deploy.yml --repo "${GITHUB_REPOSITORY}" --ref main
+          echo "已触发自动部署（auto-deploy.yml）"
