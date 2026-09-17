@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: auto-deploy-main
+  cancel-in-progress: true
+
 jobs:
   deploy:
     if: github.repository_owner == 'lll33lll'
