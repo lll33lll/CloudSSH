@@ -30,6 +30,7 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'terminal.pasteFailed': 'Could not read the clipboard. Check browser permissions.',
   'language.label': 'Language',
   'language.zhCN': '简体中文',
+  'language.zhTW': '繁體中文',
   'language.enUS': 'English',
   'language.switchTo': 'Switch to {language}',
   'common.confirm': 'Confirm',
@@ -91,6 +92,40 @@ export const enUS: Record<keyof typeof zhCN, string> = {
     'Sign in with an administrator-approved account before using SSH and account features.',
   'auth.githubNotConfigured':
     'GitHub OAuth is not fully configured, so sign-in is currently unavailable.',
+  // --- Single-admin password sign-in (alternative auth mode, mutually exclusive with GitHub) ---
+  'auth.adminLogin': 'Admin Login',
+  'auth.adminLoginTitle': 'Admin Sign In',
+  'auth.adminPasswordLabel': 'Admin Password',
+  'auth.adminLoginSubmit': 'Sign In',
+  'auth.adminLoginCancel': 'Cancel',
+  'auth.adminRequired': 'This CloudSSH instance requires admin sign-in',
+  'auth.adminRequiredHint': 'Sign in with the admin password to use SSH and account features.',
+  'auth.adminHashInvalidTitle': 'Admin password configuration is invalid',
+  'auth.adminHashInvalid':
+    'ADMIN_PASSWORD_HASH is malformed; sign-in is disabled. Ask the administrator to fix it.',
+  'auth.adminLoginFailed': 'Incorrect password',
+  'auth.adminLoginLocked': 'Too many attempts. Try again in {seconds} seconds.',
+  'auth.adminLoginTurnstileFailed': 'Human verification failed. Please try again.',
+  'auth.adminLoginUnavailable':
+    'Password sign-in is unavailable (auth mode may have changed). Refresh the page.',
+  'auth.adminLoginNetwork': 'Network error. Please try again later.',
+  // --- Admin password hash generator (in-browser local ADMIN_PASSWORD_HASH generation) ---
+  'auth.adminHashGenTitle': 'Admin Password Sign-In Setup',
+  'auth.adminHashGenHint':
+    'Generate the admin password credential locally in your browser: the password never leaves this device and is not bound to it — you can sign in with it from any device.',
+  'auth.adminHashGenSteps':
+    '1. Copy the hash above\n2. Cloudflare Dashboard → Workers → Variables → add ADMIN_PASSWORD_HASH (Secret type), paste and save\n3. Return to this page, reload, and sign in with the password',
+  'auth.adminHashGenPassword': 'Set admin password',
+  'auth.adminHashGenConfirm': 'Confirm password',
+  'auth.adminHashGenResultLabel': 'ADMIN_PASSWORD_HASH (copy and paste into the Cloudflare Dashboard)',
+  'auth.adminHashGenCopy': 'Copy',
+  'auth.adminHashGenGenerate': 'Generate hash',
+  'auth.adminHashGenTooShort': 'Password must be at least 10 characters.',
+  'auth.adminHashGenMismatch': 'Passwords do not match.',
+  'auth.adminHashGenCopied': 'Copied to clipboard',
+  'auth.adminHashGenNetwork': 'Generation failed. Please try again.',
+  'auth.adminHashGenEntry': 'Admin password sign-in setup',
+  'auth.adminHashGenRegenerate': 'Regenerate in browser',
   'auth.validationHostUser': 'Enter a host address and username.',
   'auth.validationPort': 'Port must be an integer from 1 to 65535.',
   'auth.validationPassword': 'Enter a password.',
@@ -176,7 +211,6 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'server.savedTunnel': 'Saved. Will connect via Cloudflare Tunnel.',
   'server.invalidTunnelHost':
     'Invalid Cloudflare tunnel hostname. Must be a valid public domain (e.g. ssh.example.com)',
-  'server.tunnelPortHint': 'Default 22 (actual port is configured in internal cloudflared)',
   'server.clearSecret': 'Clear saved secret',
   'server.secretCleared': 'Marked for removal (takes effect on save)',
   'server.reenterSecretOnClone': 'Re-enter Client Secret for clone',
@@ -494,10 +528,14 @@ export const enUS: Record<keyof typeof zhCN, string> = {
   'agent.chipSystem': 'System load',
   'agent.chipNetwork': 'Ports & network',
   'agent.chipDocker': 'Docker status',
-  'agent.promptError': 'Please read the terminal context, analyze the recent error output, and suggest fixes.',
-  'agent.promptSystem': 'Please check current CPU, memory, and disk usage, and identify causes of high load.',
-  'agent.promptNetwork': 'Please check listening ports and connection status to diagnose network issues.',
-  'agent.promptDocker': 'Please check Docker container status and logs of recently exited containers.',
+  'agent.promptError':
+    'Please read the terminal context, analyze the recent error output, and suggest fixes.',
+  'agent.promptSystem':
+    'Please check current CPU, memory, and disk usage, and identify causes of high load.',
+  'agent.promptNetwork':
+    'Please check listening ports and connection status to diagnose network issues.',
+  'agent.promptDocker':
+    'Please check Docker container status and logs of recently exited containers.',
   'agent.send': 'Send',
   'agent.stop': 'Stop',
   'agent.stopped': 'Agent task stopped by user.',
