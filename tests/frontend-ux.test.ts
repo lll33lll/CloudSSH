@@ -8,6 +8,7 @@ import {
   normalizeTagsInput,
   paginateServers,
   resolveServerPageSize,
+  sortServers,
   type ServerConfig,
 } from '../frontend/src/server-list';
 import { resolveTerminalFontSize } from '../frontend/src/terminal-layout';
@@ -91,6 +92,85 @@ describe('服务器列表搜索', () => {
       currentPage: 2,
       totalPages: 2,
     });
+  });
+});
+
+describe('服务器列表多维排序', () => {
+  const sampleServers: ServerConfig[] = [
+    {
+      id: 1,
+      user_id: 1,
+      name: 'Beta Server',
+      host: 'beta.com',
+      port: 22,
+      username: 'root',
+      auth_method: 'password',
+      tags: [],
+      last_connected_at: 1000,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-02T00:00:00Z',
+    },
+    {
+      id: 2,
+      user_id: 1,
+      name: 'Alpha Server',
+      host: 'alpha.com',
+      port: 22,
+      username: 'root',
+      auth_method: 'password',
+      tags: [],
+      last_connected_at: 5000,
+      created_at: '2026-01-02T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    },
+    {
+      id: 3,
+      user_id: 1,
+      name: 'Gamma Server',
+      host: 'gamma.com',
+      port: 22,
+      username: 'root',
+      auth_method: 'password',
+      tags: [],
+      last_connected_at: null,
+      created_at: '2026-01-03T00:00:00Z',
+      updated_at: '2026-01-03T00:00:00Z',
+    },
+  ];
+
+  it('recent 模式优先按最近连接时间倒序，未连接者后置', () => {
+    const sorted = sortServers(sampleServers, 'recent');
+    expect(sorted.map((s) => s.id)).toEqual([2, 1, 3]);
+  });
+
+  it('name 模式按服务器名称 A-Z 升序', () => {
+    const sorted = sortServers(sampleServers, 'name');
+    expect(sorted.map((s) => s.id)).toEqual([2, 1, 3]);
+  });
+
+  it('created 模式按创建时间倒序', () => {
+    const sorted = sortServers(sampleServers, 'created');
+    expect(sorted.map((s) => s.id)).toEqual([3, 2, 1]);
+  });
+
+  it('updated 模式按修改时间倒序', () => {
+    const sorted = sortServers(sampleServers, 'updated');
+    expect(sorted.map((s) => s.id)).toEqual([3, 1, 2]);
+  });
+
+  it('ServerList 提供 refresh 方法并在返回主页时联动刷新', () => {
+    const serverListSource = readFileSync(
+      new URL('../frontend/src/server-list.ts', import.meta.url),
+      'utf8'
+    );
+    const mainSource = readFileSync(
+      new URL('../frontend/src/main.ts', import.meta.url),
+      'utf8'
+    );
+
+    expect(serverListSource).toContain('async refresh(): Promise<void>');
+    expect(serverListSource).toContain('server.last_connected_at = Date.now()');
+    expect(mainSource).toContain('serverList?.refresh()');
   });
 });
 
