@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 import { blockOptionalThirdPartyAssets } from './helpers';
 
 test('强制 GitHub 登录模式隐藏匿名连接表单', async ({ page }) => {
@@ -78,6 +78,7 @@ test('AI 配置首次点击立即显示，配置数据异步加载', async ({ pa
 test('AI 模型选择下拉框：免重复输入 token 获取模型列表，且展示完整模型并支持切换与清空', async ({
   page,
 }) => {
+  await blockOptionalThirdPartyAssets(page);
   await page.route('**/api/auth/me', (route) =>
     route.fulfill({
       status: 200,

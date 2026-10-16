@@ -10,9 +10,11 @@ import {
   type UnifiedServerMemory,
 } from '../../../src/server-memory-schema';
 import { copyTextToClipboard } from '../clipboard';
+import { attachDrawerSwipeToClose } from '../drawer-swipe';
 import { getLocale, onLocaleChange, t, translateDocument } from '../i18n';
 import { confirmAction, notify } from '../ui-feedback';
 import { getTerminalFillCommand, normalizeCodeLanguage } from './code-actions';
+import { responseErrorMessage } from './response-errors';
 import {
   buildTerminalSelectionMessage,
   createTerminalSelectionContext,
@@ -80,6 +82,7 @@ export class AgentPanel {
   private isVisible: boolean = false;
   private beforeShowHandler: (() => void) | null = null;
   private isAgentRunning: boolean = false;
+  private activeRequestId: string | null = null;
   private isWaitingConfirmation: boolean = false;
   private wsSend: ((data: string) => void) | null = null;
   private getTerminalFillTarget: (() => TerminalFillTarget) | null = null;
@@ -102,6 +105,7 @@ export class AgentPanel {
   private autoConfirmTimer: number | null = null;
   private autoConfirmInterval: number | null = null;
   private pendingConfirmation: {
+    confirmationId: string;
     command: string;
     element: HTMLElement;
     previousFocus: HTMLElement | null;
@@ -127,6 +131,7 @@ export class AgentPanel {
   private memoryBatchCancelBtn: HTMLButtonElement | null = null;
   private memoryBatchDeleteBtn: HTMLButtonElement | null = null;
   private revealedSecretIds: Set<number> = new Set();
+  private hasConfirmedSession: boolean = false;
   private sessionMessages: Array<{
     role: string;
     content: string;
@@ -240,7 +245,7 @@ export class AgentPanel {
         <div class="agent-panel-header flex items-center justify-between px-4 h-12 border-b border-[var(--border)] bg-[var(--bg-elevated)] shrink-0">
           <div class="flex items-center gap-2 min-w-0">
             <span class="material-symbols-outlined text-[var(--accent-secondary)]" style="font-size: 18px; font-variation-settings: 'FILL' 1;">smart_toy</span>
-            <span class="text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)] truncate" data-i18n="agent.title">AI Agent 助手</span>
+            <span class="agent-panel-title text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)] truncate" data-i18n="agent.title">AI Agent 助手</span>
           </div>
           <div class="flex items-center gap-1.5">
             <div id="agent-mode-control" class="agent-mode-segmented" role="radiogroup" aria-label="Agent execution mode" data-active-mode="${this.agentMode}">
@@ -353,6 +358,10 @@ export class AgentPanel {
     });
 
     this.parentEl.appendChild(this.panelEl);
+    attachDrawerSwipeToClose(this.panelEl, {
+      headerSelector: '.agent-panel-header',
+      onClose: () => this.hide(),
+    });
     this.messagesEl = this.panelEl.querySelector('#agent-messages');
     this.contextEl = this.panelEl.querySelector('#agent-context');
     this.inputEl = this.panelEl.querySelector('#agent-input') as HTMLTextAreaElement;
@@ -515,7 +524,24 @@ export class AgentPanel {
   }
 
   handleAgentFrame(msg: any): void {
+    // Correlation is local UI state, never an authentication credential.
+    if (msg.requestId && msg.requestId !== this.activeRequestId) return;
+    if (msg.requestId && !this.isAgentRunning &&
+      ['run_start', 'thinking', 'executing', 'stream_chunk', 'stream_end'].includes(msg.subType)) return;
     switch (msg.subType) {
+      case 'run_start':
+        this.isAgentRunning = true;
+        this.hasConfirmedSession = true;
+        this.updateInputState();
+        break;
+      case 'run_end':
+        this.isAgentRunning = false;
+        this.rejectPendingConfirmation(false);
+        if (this.streamingEl) this.markLastActiveMessageAborted();
+        this.collapseThinkingProcess();
+        this.saveSessionDraft(msg.outcome !== 'completed');
+        this.updateInputState();
+        break;
       case 'thinking':
         this.showThinking(msg.iteration);
         break;
@@ -527,31 +553,37 @@ export class AgentPanel {
         break;
       case 'stream_end':
         this.handleStreamEnd(msg.content);
-        this.isAgentRunning = false;
-        this.updateInputState();
         break;
       case 'response':
-        this.addAgentResponse(msg.content);
-        this.isAgentRunning = false;
-        this.updateInputState();
+        this.addAgentResponse(msg.messageKey ? t(msg.messageKey) : msg.content);
         break;
       case 'confirm_required':
-        this.showConfirmDialog(msg.command, msg.reason);
+        this.showConfirmDialog(msg.command, msg.reason, msg.confirmationId);
+        break;
+      case 'confirm_closed':
+        if (this.pendingConfirmation?.confirmationId === msg.confirmationId) {
+          this.resolvePendingConfirmation(false, false, msg.confirmationId, false);
+        }
         break;
       case 'error':
-        this.showError(msg.message);
-        this.isAgentRunning = false;
-        this.updateInputState();
+        this.showError(msg.code ? responseErrorMessage(msg.code, msg.status) : msg.message);
+        // Pre-run SSH/auth errors have no run_end; protocol errors do.
+        if (msg.runId == null) {
+          this.isAgentRunning = false;
+          this.updateInputState();
+        }
         break;
       case 'progress_extend':
-        this.showProgressExtend(msg.message, msg.currentIteration, msg.newMax, msg.reason);
+        this.showProgressExtend(t('agent.progressContinue'), msg.currentIteration, msg.newMax, t('agent.progressActive'));
         break;
       case 'reset_done':
+        if (this.isAgentRunning) break;
+        this.activeRequestId = null;
         this.isAgentRunning = false;
         this.updateInputState();
         break;
       case 'memory_updated':
-        this.clearSessionDraft();
+        if (!this.isAgentRunning) this.clearSessionDraft();
         if (this.serverId) {
           void this.fetchServerMemory();
         }
@@ -579,6 +611,7 @@ export class AgentPanel {
     if (!message) return false;
     if (this.isWaitingConfirmation) return false;
 
+    this.activeRequestId = crypto.randomUUID();
     const isSupersede = this.isAgentRunning;
     if (isSupersede) {
       this.markLastActiveMessageAborted();
@@ -604,6 +637,7 @@ export class AgentPanel {
     const payload = {
       type: 'agent_start',
       message: outboundMessage,
+      requestId: this.activeRequestId,
       locale: getLocale(),
       timezone,
       supersede: isSupersede ? true : undefined,
@@ -691,6 +725,8 @@ export class AgentPanel {
   }
 
   private resetPanelState(): void {
+    this.activeRequestId = null;
+    this.hasConfirmedSession = false;
     this.sessionMessages = [];
     this.clearSessionDraft();
     if (this.messagesEl) {
@@ -762,8 +798,30 @@ export class AgentPanel {
       });
   }
 
+  private reactivateThinkingProcess(): void {
+    if (!this.thinkingProcessEl || !this.thinkingIsDone) return;
+    this.thinkingIsDone = false;
+    this.thinkingProcessEl.classList.remove('tp-done', 'tp-expanded');
+
+    const mainIcon = this.thinkingProcessEl.querySelector('.tp-icon') as HTMLElement | null;
+    if (mainIcon) mainIcon.textContent = 'smart_toy';
+
+    const dots = this.thinkingProcessEl.querySelector('.thinking-dots') as HTMLElement | null;
+    if (dots) dots.style.display = '';
+
+    if (this.thinkingStatusEl) {
+      this.thinkingStatusEl.textContent = t('agent.processingSteps', {
+        count: this.thinkingStepCount,
+      });
+    }
+  }
+
   private showThinking(iteration: number): void {
+    if (this.streamingEl) {
+      this.convertStreamToThoughtStep();
+    }
     this.ensureThinkingProcess();
+    this.reactivateThinkingProcess();
     const firstIteration = iteration === 0;
     if (!firstIteration) {
       this.addThinkingStep('thinking', t('agent.thinkingStep', { step: iteration + 1 }));
@@ -777,6 +835,7 @@ export class AgentPanel {
       this.convertStreamToThoughtStep();
     }
     this.ensureThinkingProcess();
+    this.reactivateThinkingProcess();
     const cmd = args?.command || '';
     const label =
       tool === 'ask_user_confirmation'
@@ -881,8 +940,16 @@ export class AgentPanel {
   }
 
   private collapseThinkingProcess(): void {
-    if (!this.thinkingProcessEl || this.thinkingIsDone) return;
+    if (!this.thinkingProcessEl) return;
+    const wasDone = this.thinkingIsDone;
     this.thinkingIsDone = true;
+
+    // 终态下无条件清空外部实时预览容器与缓存，确保折叠时完全收纳
+    if (this.thinkingLiveEl) this.thinkingLiveEl.replaceChildren();
+    this.livePreviewCache = [];
+    this.thinkingProcessEl.classList.add('tp-done');
+
+    if (wasDone) return;
 
     if (this.thinkingCurrentEl?.firstElementChild) {
       this.thinkingStepsEl?.appendChild(this.thinkingCurrentEl.firstElementChild);
@@ -953,7 +1020,7 @@ export class AgentPanel {
     }
     this.collapseThinkingProcess();
     this.sessionMessages.push({ role: 'response', content: content || '' });
-    this.saveSessionDraft(false);
+    this.saveSessionDraft(this.isAgentRunning);
     this.appendMessage('response', content || '');
   }
 
@@ -1011,13 +1078,18 @@ export class AgentPanel {
         // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
         tmp.innerHTML = this.renderMarkdown(finalContent);
         const inner = tmp.querySelector('.agent-md-content');
-        // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-        contentEl.innerHTML = inner ? inner.innerHTML : finalContent;
+        if (inner) {
+          // Sanitized renderMarkdown output only; missing wrapper falls back to text.
+          // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+          contentEl.innerHTML = inner.innerHTML;
+        } else {
+          contentEl.textContent = finalContent;
+        }
         this.enhanceCodeBlocks(contentEl);
       }
       this.attachResponseActions(this.streamingEl, finalContent);
       this.sessionMessages.push({ role: 'response', content: finalContent });
-      this.saveSessionDraft(false);
+      this.saveSessionDraft(this.isAgentRunning);
       this.streamingEl = null;
       this.streamingText = '';
     } else {
@@ -1064,7 +1136,12 @@ export class AgentPanel {
     this.scrollToBottom();
   }
 
-  private showConfirmDialog(command: string, reason: string): void {
+  private showConfirmDialog(command: string, reason: string, confirmationId: unknown): void {
+    if (typeof confirmationId !== 'string' || !/^[A-Za-z0-9_-]{16,64}$/.test(confirmationId)) {
+      // Fail closed for legacy/malformed requests; never send an unbound approval.
+      this.wsSend?.(JSON.stringify({ type: 'agent_confirm', approved: false, command, confirmationId }));
+      return;
+    }
     this.clearAutoConfirmTimers();
     if (this.streamingEl) {
       this.convertStreamToThoughtStep();
@@ -1072,7 +1149,7 @@ export class AgentPanel {
     const terminalSectionHidden =
       document.getElementById('terminal-section')?.classList.contains('hidden') ?? false;
     if (!this.isVisible || this.parentEl.style.display === 'none' || terminalSectionHidden) {
-      this.wsSend?.(JSON.stringify({ type: 'agent_confirm', approved: false, command }));
+      this.wsSend?.(JSON.stringify({ type: 'agent_confirm', approved: false, command, confirmationId }));
       return;
     }
     this.rejectPendingConfirmation(false);
@@ -1119,22 +1196,23 @@ export class AgentPanel {
     const rejectButton = el.querySelector<HTMLButtonElement>('.agent-confirm-no')!;
     const confirmButton = el.querySelector<HTMLButtonElement>('.agent-confirm-yes')!;
     this.pendingConfirmation = {
+      confirmationId,
       command,
       element: el,
       previousFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null,
     };
 
     rejectButton.addEventListener('click', () => {
-      this.resolvePendingConfirmation(false);
+      this.resolvePendingConfirmation(false, true, confirmationId);
     });
     confirmButton.addEventListener('click', () => {
-      this.resolvePendingConfirmation(true);
+      this.resolvePendingConfirmation(true, true, confirmationId);
     });
     el.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
-        this.resolvePendingConfirmation(false);
+        this.resolvePendingConfirmation(false, true, confirmationId);
         return;
       }
       if (event.key !== 'Tab') return;
@@ -1164,6 +1242,7 @@ export class AgentPanel {
       }
 
       this.autoConfirmInterval = window.setInterval(() => {
+        if (this.pendingConfirmation?.confirmationId !== confirmationId) return;
         remaining -= 1;
         if (remaining > 0 && confirmButton.isConnected) {
           confirmButton.textContent = t('agent.confirmAutoCountdown', { seconds: remaining });
@@ -1176,25 +1255,24 @@ export class AgentPanel {
       }, 1000);
 
       this.autoConfirmTimer = window.setTimeout(() => {
+        if (this.pendingConfirmation?.confirmationId !== confirmationId) return;
         this.clearAutoConfirmTimers();
-        if (this.pendingConfirmation?.command === command) {
-          this.resolvePendingConfirmation(true);
-        }
+        this.resolvePendingConfirmation(true, true, confirmationId);
       }, 3000);
     }
   }
 
-  private resolvePendingConfirmation(approved: boolean, restoreFocus = true): void {
-    this.clearAutoConfirmTimers();
+  private resolvePendingConfirmation(
+    approved: boolean, restoreFocus = true, expectedId?: string, notifyServer = true
+  ): void {
     const pending = this.pendingConfirmation;
-    if (!pending) return;
-
+    if (!pending || (expectedId !== undefined && pending.confirmationId !== expectedId)) return;
+    this.clearAutoConfirmTimers();
     this.pendingConfirmation = null;
-    this.wsSend?.(
+    if (notifyServer) this.wsSend?.(
       JSON.stringify({
-        type: 'agent_confirm',
-        approved,
-        command: pending.command,
+        type: 'agent_confirm', confirmationId: pending.confirmationId,
+        approved, command: pending.command,
       })
     );
     pending.element.remove();
@@ -1453,7 +1531,8 @@ export class AgentPanel {
       this.handleStop();
     }
 
-    const targetUserIndex = options.userIndex ?? 0;
+    // 若当前会话属于离线草稿加载且尚未在当前连接产生过有效运行轮次，安全归一为第 0 轮
+    const targetUserIndex = this.hasConfirmedSession ? (options.userIndex ?? 0) : 0;
 
     // 1. 删除当前消息之后的所有后续节点（思考、执行、回复等全部清除，无需保留留痕）
     while (el.nextElementSibling) {
@@ -1490,11 +1569,13 @@ export class AgentPanel {
     this.isAgentRunning = true;
     this.updateInputState();
 
-    // 5. 向后端下发带 userIndex 的 agent_start，指示后端截断 state.messages 至目标轮次并重新执行
+    // 5. 响应链从目标用户轮次之前分支；这不会撤销服务器上已经发生的操作。
+    this.activeRequestId = crypto.randomUUID();
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     const payload = {
       type: 'agent_start',
       message: newText,
+      requestId: this.activeRequestId,
       locale: getLocale(),
       timezone,
       userIndex: targetUserIndex,

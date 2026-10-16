@@ -3,6 +3,7 @@ import { openAdminHashGeneratorDialog } from './admin-hash-generator';
 import { ConnectionForm } from './auth-form';
 import { initI18n, onLocaleChange, t } from './i18n';
 import { MobileTerminalController } from './mobile-terminal';
+import { MobileShortcutsManager } from './mobile-shortcuts-manager';
 import { ServerList } from './server-list';
 import {
   type ClaimedShare,
@@ -33,8 +34,10 @@ let connectionForm: ConnectionForm | null = null;
 let serverList: ServerList | null = null;
 let isLoggedIn = false;
 let sharedSessionMode = false;
+const mobileShortcutsManager = new MobileShortcutsManager();
 const mobileTerminalController = new MobileTerminalController(
-  () => tabManager?.getActiveTab()?.terminal ?? null
+  () => tabManager?.getActiveTab()?.terminal ?? null,
+  mobileShortcutsManager
 );
 const snippetManager = new SnippetManager({
   getTerminal: () => tabManager?.getActiveTab()?.terminal ?? null,
@@ -227,6 +230,7 @@ function initTerminalTab(): void {
   // 匿名模式直连：确保 AI Agent 入口隐藏
   document.getElementById('agent-toggle-btn')?.classList.add('hidden');
   document.getElementById('mobile-agent-btn')?.classList.add('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.add('hidden');
 
   // 隐藏标签栏（URL 直连模式只有一个标签，不需要标签栏）
   const tabBar = document.getElementById('tab-bar');
@@ -262,6 +266,8 @@ function showAuthSection(): void {
   // 匿名模式/退出登录：隐藏 AI Agent 按钮（桌面分段条与移动端菜单）
   document.getElementById('agent-toggle-btn')?.classList.add('hidden');
   document.getElementById('mobile-agent-btn')?.classList.add('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.add('hidden');
+  mobileShortcutsManager.setLoggedIn(false);
 
   if (!connectionForm) {
     connectionForm = new ConnectionForm({
@@ -290,6 +296,8 @@ function showUserSpace(user: {
   // Show agent toggle button for logged-in users
   document.getElementById('agent-toggle-btn')?.classList.remove('hidden');
   document.getElementById('mobile-agent-btn')?.classList.remove('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.remove('hidden');
+  mobileShortcutsManager.setLoggedIn(true);
 
   serverList = new ServerList(
     user,
@@ -375,6 +383,7 @@ function showTerminalWithNewTab(
 
   const tm = getTabManager();
   const tab = tm.createTab(displayLabel, hostInfo);
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.toggle('hidden', !isLoggedIn || sharedSessionMode);
 
   return { tab, terminal: tab.terminal };
 }
@@ -409,6 +418,7 @@ function showSharedTerminal(claim: ClaimedShare): void {
   isLoggedIn = false;
   document.getElementById('agent-toggle-btn')?.classList.add('hidden');
   document.getElementById('mobile-agent-btn')?.classList.add('hidden');
+  document.getElementById('mobile-shortcuts-terminal-btn')?.classList.add('hidden');
   document.getElementById('snippet-toggle-btn')?.classList.add('hidden');
   document.getElementById('mobile-snippets-btn')?.classList.add('hidden');
   const tabBar = document.getElementById('tab-bar');
@@ -569,6 +579,10 @@ const aiConfigPanel = new AIConfigPanel();
 
 document.getElementById('ai-config-btn')?.addEventListener('click', () => {
   aiConfigPanel.show();
+});
+
+document.getElementById('mobile-shortcuts-config-btn')?.addEventListener('click', () => {
+  mobileShortcutsManager.showModal();
 });
 
 const askAISelectionButton = document.getElementById('ask-ai-selection-btn');
@@ -875,11 +889,14 @@ async function restoreCloudTheme(
 // ==================== 初始化 ====================
 
 /**
- * macOS 26 液态玻璃动态指针天光追踪：
- * 仅在 liquid 风格下监听 pointermove 并通过 requestAnimationFrame 节流更新 --mx 和 --my，
+ * 卡片指针聚光追踪（全主题通用）：
+ * 监听 pointermove 并通过 requestAnimationFrame 节流更新 --mx 和 --my，
  * 纯变量传导，零 DOM 重排，GPU 仅更新 radial-gradient 聚光位置。
+ * 触屏设备无悬停语义（CSS 侧同步隐藏聚光层），直接不注册以省电。
  */
 function initPointerSpecularTracking(): void {
+  if (window.matchMedia?.('(hover: none) and (pointer: coarse)').matches) return;
+
   let rafId: number | null = null;
   let targetCard: HTMLElement | null = null;
   let px = 50;
@@ -888,9 +905,8 @@ function initPointerSpecularTracking(): void {
   document.addEventListener(
     'pointermove',
     (e: PointerEvent) => {
-      if (document.documentElement.dataset.uiStyle !== 'liquid') return;
       const card = (e.target as HTMLElement | null)?.closest?.(
-        '.server-card, .cyber-box'
+        '.server-card, .cyber-box, .sftp-entry'
       ) as HTMLElement | null;
       if (!card) {
         targetCard = null;

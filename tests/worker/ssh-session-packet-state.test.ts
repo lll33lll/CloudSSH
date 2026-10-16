@@ -1,6 +1,7 @@
 /// <reference lib="es2022" />
 import { describe, expect, it, vi } from 'vitest';
-import { SSHAESCTRCipher, SSHHMAC } from '../../src/ssh/crypto';
+import { SSHAESCTRCipher, SSHAESGCMCipher, SSHHMAC } from '../../src/ssh/crypto';
+import { KEXInitBuilder } from '../../src/ssh/kex';
 import { SSHPacketBuilder } from '../../src/ssh/packet';
 import { concat } from '../../src/ssh/utils';
 import { SSHSession } from '../../src/worker/ssh-session';
@@ -23,6 +24,67 @@ function createSession() {
 }
 
 describe('SSHSession packet encryption state', () => {
+  it('close during an awaited parse prevents subsequent packet dispatch', async () => {
+    const { session } = createSession();
+    const internal = session as any;
+    let finish!: (packet: any) => void;
+    internal.packetParser = {
+      nextPacket: vi.fn(() => new Promise(resolve => { finish = resolve; })),
+      getBufferLength: vi.fn(() => 0), clear: vi.fn(),
+    };
+    internal.handlePacket = vi.fn();
+    const processing = internal.processPackets();
+    session.close(true);
+    finish({ payload: new Uint8Array([2]), length: 1, paddingLength: 0 });
+    await processing;
+    expect(internal.handlePacket).not.toHaveBeenCalled();
+    expect(internal.packetParser.clear).toHaveBeenCalledOnce();
+  });
+
+  it('close during socket read never feeds late bytes back into cleared buffers', async () => {
+    const { session, socket } = createSession();
+    const internal = session as any;
+    let finish!: (result: any) => void;
+    Object.assign(socket, { readable: { getReader: () => ({
+      read: () => new Promise(resolve => { finish = resolve; }),
+    }) } });
+    const feed = vi.spyOn(internal.packetParser, 'feed');
+    const reading = internal.startReading();
+    session.close(true);
+    finish({ done: false, value: new Uint8Array(100) });
+    await reading;
+    expect(feed).not.toHaveBeenCalled();
+    expect(internal.packetParser.getBufferLength()).toBe(0);
+  });
+
+  it('invalid GCM tag closes TCP/WS immediately and discards queued packets', async () => {
+    const { session, ws, socket } = createSession();
+    const internal = session as any;
+    const key = new Uint8Array(16);
+    const iv = new Uint8Array(12);
+    const encrypt = new SSHAESGCMCipher(key, iv);
+    const decrypt = new SSHAESGCMCipher(key, iv);
+    await encrypt.init();
+    await decrypt.init();
+    internal.state = 'ready';
+    internal.negotiatedCipherS2C = 'aes128-gcm@openssh.com';
+    internal.decryptCipher = decrypt;
+    const decryptSpy = vi.spyOn(decrypt, 'decrypt');
+    const wire = await SSHPacketBuilder.build(
+      new Uint8Array([2]), 16, (data, seq, aad) => encrypt.encrypt(data, seq, aad), 0, true
+    );
+    wire[wire.length - 1] ^= 1;
+    internal.packetParser.feed(concat(wire, wire));
+    await internal.processPackets();
+    expect(socket.close).toHaveBeenCalledOnce();
+    expect(ws.close).toHaveBeenCalledWith(1011);
+    expect(ws.send).toHaveBeenCalledWith(expect.stringContaining('packet_error'));
+    expect(internal.packetParser.getBufferLength()).toBe(0);
+    expect(decryptSpy).toHaveBeenCalledOnce();
+    await internal.processPackets();
+    expect(decryptSpy).toHaveBeenCalledOnce();
+  });
+
   it.each([
     {
       cipher: 'aes128-gcm@openssh.com',
@@ -124,6 +186,75 @@ describe('SSHSession packet encryption state', () => {
     expect(handlePacket.mock.calls.map(([packet]: any[]) => packet.payload[0])).toEqual([21, 7]);
     expect(internal.packetParser.getBufferLength()).toBe(0);
     expect(internal.state).toBe('auth');
+    expect(ws.close).not.toHaveBeenCalled();
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it('sendMutex resets to a fresh resolved Promise when queue drains to prevent unbounded chain leak', async () => {
+    const { session } = createSession();
+    const internal = session as any;
+    internal.socketWriter = { write: vi.fn(async () => {}) };
+
+    const initialMutex = internal.sendMutex;
+    await internal.sendEncryptedPacket(async () => new Uint8Array([1, 2, 3]));
+
+    // After all writes finish, sendMutex is reset to a fresh resolved Promise
+    expect(internal.sendMutexPendingCount).toBe(0);
+    expect(internal.sendMutex).not.toBe(initialMutex);
+
+    // Verify it resolves immediately without pending chain
+    let resolved = false;
+    void internal.sendMutex.then(() => {
+      resolved = true;
+    });
+    await Promise.resolve();
+    expect(resolved).toBe(true);
+  });
+
+  it('handles server-initiated SSH_MSG_KEXINIT in ready state (Rekeying) and restores ready state seamlessly', async () => {
+    const { session, ws, socket } = createSession();
+    const internal = session as any;
+
+    internal.state = 'ready';
+    internal.encryptCipher = { encrypt: vi.fn(async (d: Uint8Array) => d) };
+    internal.decryptCipher = { decrypt: vi.fn(async (d: Uint8Array) => d) };
+    internal.writeSocket = vi.fn(async () => {});
+    internal.enableEncryption = vi.fn(async () => {});
+    internal.handleECDHReply = vi.fn(async () => {});
+
+    // Valid KEXINIT payload from server
+    const serverKexPayload = KEXInitBuilder.build();
+
+    // Step 1: Server sends KEXINIT during ready state
+    await internal.handlePacket({
+      length: serverKexPayload.length,
+      paddingLength: 0,
+      payload: serverKexPayload,
+    });
+
+    expect(internal.isRekeying).toBe(true);
+    expect(internal.state).toBe('rekey');
+    expect(internal.isReady()).toBe(true); // isReady() reports true during rekeying to avoid false disconnects
+
+    // Step 2: Server sends ECDH reply
+    await internal.handlePacket({
+      length: 1,
+      paddingLength: 0,
+      payload: new Uint8Array([31]), // SSH_MSG_KEX_ECDH_REPLY
+    });
+    expect(internal.handleECDHReply).toHaveBeenCalled();
+
+    // Step 3: Server sends NEWKEYS
+    await internal.handlePacket({
+      length: 1,
+      paddingLength: 0,
+      payload: new Uint8Array([21]), // SSH_MSG_NEWKEYS
+    });
+
+    // Successfully completes rekeying and restores to ready state
+    expect(internal.isRekeying).toBe(false);
+    expect(internal.state).toBe('ready');
+    expect(internal.enableEncryption).toHaveBeenCalled();
     expect(ws.close).not.toHaveBeenCalled();
     expect(socket.close).not.toHaveBeenCalled();
   });
