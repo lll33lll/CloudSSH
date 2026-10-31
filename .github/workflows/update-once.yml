@@ -1,7 +1,8 @@
-name: Update once (deploy upstream main)
+name: Update once (deploy upstream main + sync fork)
 
-# 一次性更新用：直接构建并部署上游 newbietan/CloudSSH 的 main，
-# 然后把 fork 的 main 同步到上游。部署完成后本文件可删除。
+# 一次性更新用：构建并部署上游 newbietan/CloudSSH 的 main，再把 fork 的 main
+# 合并到上游版本（保留 fork 自己的 .github/workflows，绕开 workflows 权限限制）。
+# 跑完可删掉本文件。
 on:
   push:
     paths:
@@ -41,13 +42,11 @@ jobs:
           cache: "pnpm"
           cache-dependency-path: upstream/pnpm-lock.yaml
 
-      - name: Install
+      - name: Install and build
         working-directory: upstream
-        run: pnpm install --frozen-lockfile
-
-      - name: Build frontend
-        working-directory: upstream
-        run: pnpm run build:frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build:frontend
 
       - name: Deploy worker
         working-directory: upstream
@@ -56,10 +55,28 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: pnpm exec wrangler deploy
 
-      - name: Sync fork from upstream
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          path: fork
+          fetch-depth: 0
+
+      - name: Merge upstream into fork
+        working-directory: fork
         run: |
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main \
-            || echo "merge-upstream failed (upstream likely changed .github/workflows)"
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/newbietan/CloudSSH.git
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "fork already contains upstream main"
+            exit 0
+          fi
+          git merge --no-commit --no-ff -X ours upstream/main || true
+          git reset -q HEAD -- .github
+          git checkout HEAD -- .github
+          git clean -fdq .github
+          git add -A
+          git commit -m "chore: merge upstream main (keep fork .github)" || echo "nothing to commit"
+          git push origin HEAD:main
