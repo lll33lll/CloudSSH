@@ -1,0 +1,65 @@
+name: Update once (deploy upstream main)
+
+# 一次性更新用：直接构建并部署上游 newbietan/CloudSSH 的 main，
+# 然后把 fork 的 main 同步到上游。部署完成后本文件可删除。
+on:
+  push:
+    paths:
+      - ".github/workflows/update-once.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-once-cloudssh
+  cancel-in-progress: false
+
+jobs:
+  deploy-upstream:
+    if: github.repository_owner == 'lll33lll'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout upstream main
+        uses: actions/checkout@v4
+        with:
+          repository: newbietan/CloudSSH
+          ref: main
+          path: upstream
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "11.8.0"
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: upstream/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: upstream
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: upstream
+        run: pnpm run build:frontend
+
+      - name: Deploy worker
+        working-directory: upstream
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm exec wrangler deploy
+
+      - name: Sync fork from upstream
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main \
+            || echo "merge-upstream failed (upstream likely changed .github/workflows)"
