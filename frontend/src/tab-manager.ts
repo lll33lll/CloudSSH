@@ -4,7 +4,7 @@ import { maskIPAddress } from './host-display';
 import { t } from './i18n';
 import { getNetworkQuality } from './network-quality';
 import { SFTPPanel } from './sftp-panel';
-import { SSHTerminal, type TerminalSelectionAnchor } from './terminal';
+import { SSHTerminal, type SSHHostInfo, type TerminalSelectionAnchor } from './terminal';
 import { notify } from './ui-feedback';
 
 export type TabState = 'connecting' | 'connected' | 'disconnected';
@@ -16,7 +16,7 @@ export interface TabInfo {
   sftpPanel: SFTPPanel | null;
   agentPanel: AgentPanel | null;
   containerEl: HTMLElement;
-  hostInfo?: { host: string; port: number; username?: string; serverId?: number };
+  hostInfo?: SSHHostInfo;
   state: TabState;
   cfLatency?: number;
   cfColo?: string;
@@ -96,7 +96,7 @@ export class TabManager {
 
   createTab(
     label: string,
-    hostInfo?: { host: string; port: number; username?: string; serverId?: number }
+    hostInfo?: SSHHostInfo
   ): TabInfo {
     const id = `tab-${++this.tabCounter}-${Date.now()}`;
 
@@ -131,10 +131,13 @@ export class TabManager {
           tab.sftpPanel.dispose();
           tab.sftpPanel = null;
         }
-        // 清理该标签的 Agent 面板
+        // A transport interruption must not destroy the surviving Agent task UI.
         if (tab.agentPanel) {
-          tab.agentPanel.dispose();
-          tab.agentPanel = null;
+          if (willReconnect) tab.agentPanel.suspendConnection();
+          else {
+            tab.agentPanel.dispose();
+            tab.agentPanel = null;
+          }
         }
         tab.selectedText = '';
         tab.selectionAnchor = null;
@@ -143,9 +146,16 @@ export class TabManager {
     });
 
     // 设置 SSH 就绪回调：初始化 SFTP 面板 + Agent 面板
-    terminal.setSessionReadyHandler(() => {
+    terminal.setSessionReadyHandler((resumed = false) => {
       const tab = this.tabs.get(id);
       if (tab) {
+        if (!resumed && tab.agentPanel) {
+          if (tab.agentPanel.hasActiveTask()) {
+            notify(t('agent.previousSessionEnded'), { variant: 'warning' });
+          }
+          tab.agentPanel.dispose();
+          tab.agentPanel = null;
+        }
         tab.state = 'connected';
         this.renderTabBar();
         if (this.activeTabId === id) {
@@ -190,6 +200,7 @@ export class TabManager {
           tab.agentPanel.setLayoutChangeHandler(() => tab.terminal.fit());
           this.updateSelectionAction(tab);
         }
+        if (resumed) tab.agentPanel?.resumeConnection();
       }
     });
 

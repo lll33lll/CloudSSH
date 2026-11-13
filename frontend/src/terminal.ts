@@ -59,6 +59,8 @@ export interface SSHHostInfo {
   username?: string;
   /** 登录用户保存的服务器 ID，用于断线后重新申请一次性连接令牌。 */
   serverId?: number;
+  /** Cloudflare Zero Trust SSH CA 团队标识（用于断线重连或克隆时重新签发短期证书） */
+  cfSshCaTeam?: string | null;
 }
 
 export type ReconnectWebSocketFactory = () => Promise<WebSocket>;
@@ -70,6 +72,7 @@ export interface SSHConnectionConfig {
   password?: string;
   authMethod?: 'password' | 'publickey' | 'none';
   privateKey?: string;
+  certificate?: string;
   expectedFingerprint?: string;
   /** 匿名路径手动覆盖的区域偏好（保存服务器路径不使用此字段） */
   locationHint?: string;
@@ -168,7 +171,7 @@ export class SSHTerminal {
   private sessionReady: boolean = false;
   private restoreCursorBlinkAfterReturnPrompt: boolean = false;
   private onSessionClosed?: (event: CloseEvent, willReconnect: boolean) => void;
-  private onSessionReady?: () => void;
+  private onSessionReady?: (resumed?: boolean) => void;
   private onAgentFrameHandler?: (msg: any) => void;
   private onOSDetectedHandler?: (serverId: number, os: string) => void;
   private sftpAttachUrl: string | null = null;
@@ -423,7 +426,7 @@ export class SSHTerminal {
     this.onSessionClosed = handler;
   }
 
-  setSessionReadyHandler(handler: () => void): void {
+  setSessionReadyHandler(handler: (resumed?: boolean) => void): void {
     this.onSessionReady = handler;
   }
 
@@ -1054,6 +1057,7 @@ export class SSHTerminal {
             password: config.password,
             authMethod: config.authMethod,
             privateKey: config.privateKey,
+            certificate: config.certificate,
             expectedFingerprint: config.expectedFingerprint,
             ...this.getTerminalSize(),
           })
@@ -1204,7 +1208,7 @@ export class SSHTerminal {
                 'w-2 h-2 bg-[var(--color-primary)]',
                 t('terminal.connected')
               );
-            this.onSessionReady?.();
+            this.onSessionReady?.(true);
             this.startHeartbeat();
             return;
           }
@@ -1223,9 +1227,10 @@ export class SSHTerminal {
                 this.authChallengeDialog?.dismiss();
               }
               if (msg.event === 'shell_ready' || msg.message === 'Shell 已就绪') {
+                const wasReady = this.sessionReady;
                 this.sessionReady = true;
                 this.reconnectAttempts = 0;
-                this.onSessionReady?.();
+                if (!wasReady) this.onSessionReady?.(false);
               }
               break;
             case 'error':

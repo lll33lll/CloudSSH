@@ -1,6 +1,7 @@
 import { AIConfigPanel } from './ai-config';
 import { openAdminHashGeneratorDialog } from './admin-hash-generator';
 import { ConnectionForm } from './auth-form';
+import { type AppConfig, type InitialUser, loadInitialAppState } from './app-bootstrap';
 import { clearLegacyAgentSessionDrafts, clearUserAgentSessionDrafts } from './agent/session-draft';
 import { initI18n, onLocaleChange, t } from './i18n';
 import { MobileTerminalController } from './mobile-terminal';
@@ -26,6 +27,7 @@ import {
 import { LiquidSegmentedThemeControl } from './theme-segmented';
 import { LiquidSegmentedDrawerControl } from './drawer-segmented';
 import { customThemeModal, customThemeStore } from './custom-theme-manager';
+import { requestCloudflareSshCertificate } from './cf-ssh-ca';
 import { notify } from './ui-feedback';
 import { initVersionNotice } from './version-notice';
 
@@ -33,6 +35,7 @@ import { initVersionNotice } from './version-notice';
 
 let tabManager: TabManager | null = null;
 let connectionForm: ConnectionForm | null = null;
+let appConfig: AppConfig | null = null;
 let serverList: ServerList | null = null;
 let isLoggedIn = false;
 let currentGithubId: number | null = null;
@@ -110,10 +113,10 @@ function getTabManager(): TabManager {
         return;
       }
       try {
-        const ws = await requestSavedServerWebSocket(serverId);
+        const ws = await requestSavedServerWebSocket(serverId, tab.hostInfo?.cfSshCaTeam);
         const { terminal } = showTerminalWithNewTab(tab.label, tab.hostInfo);
         terminal.mount();
-        const reconnectFactory = () => requestSavedServerWebSocket(serverId);
+        const reconnectFactory = () => requestSavedServerWebSocket(serverId, tab.hostInfo?.cfSshCaTeam);
         terminal.connectWithWebSocket(ws, tab.hostInfo, { reconnectFactory });
       } catch (e) {
         notify(e instanceof Error ? e.message : String(e), { variant: 'danger' });
@@ -259,6 +262,7 @@ function deactivateTerminalView(): void {
 }
 
 function showAuthSection(): void {
+  if (!appConfig) return;
   deactivateTerminalView();
   document.getElementById('auth-section')!.classList.remove('hidden');
   document.getElementById('user-space-section')!.classList.add('hidden');
@@ -274,18 +278,14 @@ function showAuthSection(): void {
 
   if (!connectionForm) {
     connectionForm = new ConnectionForm({
+      config: appConfig,
       getTabManager,
     });
   }
   syncConnectionBackButtons();
 }
 
-function showUserSpace(user: {
-  id: number;
-  github_id: number;
-  username: string;
-  avatar_url: string | null;
-}): void {
+function showUserSpace(user: InitialUser, config: AppConfig): void {
   deactivateTerminalView();
   const previousGithubId = currentGithubId;
   isLoggedIn = true;
@@ -325,7 +325,8 @@ function showUserSpace(user: {
     // onConnect 回调 — 在当前页面创建新标签
     (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => {
       showTerminalFromServer(wsUrl, serverName, hostInfo);
-    }
+    },
+    config
   );
 }
 
@@ -416,7 +417,9 @@ function showTerminalFromServer(wsUrl: string, serverName: string, hostInfo?: SS
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
   const serverId = hostInfo?.serverId;
-  const reconnectFactory = serverId ? () => requestSavedServerWebSocket(serverId) : undefined;
+  const reconnectFactory = serverId
+    ? () => requestSavedServerWebSocket(serverId, hostInfo?.cfSshCaTeam)
+    : undefined;
   terminal.connectWithWebSocket(ws, hostInfo, { reconnectFactory });
 }
 
@@ -443,8 +446,21 @@ function showSharedTerminal(claim: ClaimedShare): void {
   terminal.connectWithWebSocket(socket, undefined, { resumeOnly: true });
 }
 
-async function requestSavedServerWebSocket(serverId: number): Promise<WebSocket> {
-  const response = await fetch(`/api/servers/${serverId}/connect`, { method: 'POST' });
+async function requestSavedServerWebSocket(
+  serverId: number,
+  cfSshCaTeam?: string | null
+): Promise<WebSocket> {
+  let ephemeralCredential: string | undefined;
+  if (cfSshCaTeam) {
+    const creds = await requestCloudflareSshCertificate(cfSshCaTeam);
+    ephemeralCredential = `${creds.privateKey}\n${creds.certificate}`;
+  }
+
+  const response = await fetch(`/api/servers/${serverId}/connect`, {
+    method: 'POST',
+    headers: ephemeralCredential ? { 'Content-Type': 'application/json' } : undefined,
+    body: ephemeralCredential ? JSON.stringify({ ephemeralCredential }) : undefined,
+  });
   if (!response.ok) {
     const contentType = response.headers.get('content-type') || '';
     const message = contentType.includes('application/json')
@@ -961,6 +977,14 @@ function consumeAdminSetupRoute(): void {
   openAdminHashGeneratorDialog();
 }
 
+function finishAppLoading(): void {
+  const app = document.getElementById('app')!;
+  app.hidden = false;
+  app.removeAttribute('inert');
+  app.removeAttribute('aria-hidden');
+  document.getElementById('app-loading')?.remove();
+}
+
 async function init(): Promise<void> {
   clearLegacyAgentSessionDrafts();
   initI18n();
@@ -1036,6 +1060,7 @@ async function init(): Promise<void> {
   const shareToken = takeShareTokenFromLocation();
   if (shareToken) {
     renderShareLanding(shareToken, showSharedTerminal);
+    finishAppLoading();
     return;
   }
 
@@ -1045,6 +1070,7 @@ async function init(): Promise<void> {
   // 独立终端标签页模式：URL 包含 wsUrl 参数
   if (isTerminalTab()) {
     initTerminalTab();
+    finishAppLoading();
     return;
   }
 
@@ -1055,21 +1081,39 @@ async function init(): Promise<void> {
   consumeAdminSetupRoute();
   window.addEventListener('hashchange', consumeAdminSetupRoute);
 
-  try {
-    // 检查是否已登录
-    const meRes = await fetch('/api/auth/me');
-    if (meRes.ok) {
-      const user = await meRes.json();
-      showUserSpace(user);
-      void restoreCloudTheme(initialThemeSelection, themeSelectionRevision);
-      return;
+  const loadingStatus = document.getElementById('app-loading-status')!;
+  const loadingError = document.getElementById('app-loading-error')!;
+  const retryButton = document.getElementById('app-loading-retry') as HTMLButtonElement;
+  let loading = false;
+  const loadPage = async (): Promise<void> => {
+    if (loading) return;
+    loading = true;
+    retryButton.disabled = true;
+    loadingStatus.classList.remove('hidden');
+    loadingStatus.setAttribute('aria-busy', 'true');
+    loadingError.classList.add('hidden');
+    try {
+      const state = await loadInitialAppState();
+      appConfig = state.config;
+      if (state.user) {
+        showUserSpace(state.user, state.config);
+        void restoreCloudTheme(initialThemeSelection, themeSelectionRevision);
+      } else {
+        showAuthSection();
+      }
+      finishAppLoading();
+    } catch {
+      // Unknown configuration/authentication is not permission to show an anonymous form.
+      loadingStatus.classList.add('hidden');
+      loadingError.classList.remove('hidden');
+      retryButton.disabled = false;
+    } finally {
+      loadingStatus.setAttribute('aria-busy', 'false');
+      loading = false;
     }
-  } catch {
-    // /api/auth/me 失败，继续显示匿名连接表单
-  }
-
-  // 未登录 → 显示匿名连接表单
-  showAuthSection();
+  };
+  retryButton.addEventListener('click', () => void loadPage());
+  await loadPage();
 }
 
 // 导出供 auth-form、server-list 和测试套件使用

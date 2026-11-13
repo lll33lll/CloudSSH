@@ -16,6 +16,7 @@ tests/
 ├── agent-session-draft.test.ts # Agent 草稿用户命名空间、旧格式清理与退出清理
 ├── agent-terminal-selection.test.ts # 终端选区附件和非授权安全边界
 ├── api-errors.test.ts          # API 错误信息边界与状态码
+├── app-bootstrap.test.ts      # 首屏配置/身份并行读取、失败关闭与共享超时清理
 ├── auth-challenge-dialog.test.ts # RFC 4256 认证挑战对话框交互
 ├── clipboard.test.ts              # Clipboard API 与旧版复制回退
 ├── editor-content.test.ts         # 在线编辑内容解码、BOM/换行符与嗅探
@@ -86,7 +87,30 @@ pnpm run verify
 - 业务接口与所有 PUT/POST/DELETE 必须在触发交互前显式 Mock，并核对请求方法、路径/参数、载荷和结果。页面级 `page.route()` 优先于 context 默认值；不处理的方法应 `route.fallback()`，不能统一返回成功。
 - 未声明的 API 会被中止并记录。即使应用 `catch` 后继续运行，fixture 清理阶段仍令测试失败，报告中附 `unmocked-api-requests`，只记录方法和路径，不记录查询值/正文/凭据。手工创建独立 context 时应调用 `installApiMocks()` 并在关闭后检查其守卫。
 - Playwright 始终启动全新 `--mode e2e --strictPort` Vite，不复用普通开发服务器；4173 被占用时明确失败，不漂移端口。E2E 不运行 8787 后端；漏到服务器的 `/api` 请求返回带标记的 **501 JSON**，而不是 SPA 的 **200 HTML**，页面 `route.continue()` 的绕过也会被守卫识别。普通开发仍保留 Worker 代理。
-- E2E 验证不能只查控制台是否有 `ECONNREFUSED`：须确认测试退出码、守卫检查和完整 stdout/stderr。比较耗时时保持机器、浏览器项目、worker 数和重试设置一致。
+- E2E 验证不能只查控制台是否有 `ECONNREFUSED`：须确认测试退出码、守卫检查和完整 stdout/stderr。常规耗时比较须保持机器、浏览器项目、worker 数和重试设置一致；评估并发变更时仅改变 worker 数，并分别保留报告。
+
+## 首屏加载与强制登录回归
+
+- `app-bootstrap.test.ts` 验证配置和身份请求并行、仅 401 代表未登录、无效配置/身份拒绝、失败取消另一请求、10s 请求/正文超时，以及重试重新读取而非沿用旧策略。
+- `e2e/app-bootstrap.spec.ts` 在 Chromium 和 WebKit 移动端覆盖脚本尚未加载的初始 HTML、两个接口的不同完成顺序与刷新；通过 MutationObserver 确认强制登录期间从未创建匿名连接表单，而非仅验证最终截图。
+- 浏览器测试还覆盖已登录页面、HTTP/网络/JSON 失败、超时与迟到响应、单次重试、三语/主题/减少动态、分享认领绕过加载和配置失败时仍可使用的密码设置路由。使用受控 Promise 和浏览器时钟，不以机器相关毫秒数作为闪烁门禁。
+
+## E2E CI 并发与报告
+
+- CI 默认使用 **2 个 worker**，本地默认并发仍由 Playwright 决定。所有 Chromium / WebKit 项目及用例范围不变；CI 保留最多 2 次重试、首次重试记录 trace、失败时截图，不启用全程 trace 或录像。
+- CI 生成 `playwright-report/index.html` 与 `test-results/results.json`。`deploy.yml` 在 E2E 实际执行成功或失败后、部署密钥注入前，将 `playwright-report/` 与 `test-results/` 一并上传，保留 **7 天**；取消或 E2E 未执行时不上传。报告名包含分支与运行尝试编号，避免重跑时覆盖；启动失败且尚无文件时只警告，但原测试失败仍阻止部署。
+- 在 Actions 对应运行的 **Artifacts** 中下载 `playwright-report-<branch>-<attempt>`。解压后运行 `pnpm exec playwright show-report <解压目录>/playwright-report` 查看每条用例、耗时、重试和附件；JSON 中的 `stats` / `suites` 可用于汇总与分文件分析。报告包含测试页面及模拟数据，请勿在 E2E 中使用真实凭据。
+- E2E 不设置 `continue-on-error`；上传报告成功不代表测试成功。任一门禁失败仍阻断部署，部署沿用已验证的同一份前端产物，不在配置部署 Secrets 后重新构建。
+
+```bash
+# 单 worker 对照 / 排查并发问题（也可将 CI 配置回退为 1）
+CI=true pnpm exec playwright test --workers=1
+
+# 两 worker 验证；每次运行会重建报告，比较前请先另存上一份
+CI=true pnpm exec playwright test --workers=2
+```
+
+基线参考：v2.10.3 的 457 项浏览器用例（456 通过、1 跳过），单 worker 的 [main CI](https://github.com/newbietan/CloudSSH/actions/runs/42570709206) 为 17 分 06 秒，[test CI](https://github.com/newbietan/CloudSSH/actions/runs/42570913350) 为 16 分 46 秒；这不是其他机器的固定时长。两 worker 应在同类 runner、相同浏览器版本与用例范围下观察多轮耗时、重试/偶发失败及 OOM。收益不足或出现新增竞态时回退单 worker，保留报告能力；不削减覆盖、放宽超时或跳过失败来换速度。
 
 ## 当前覆盖范围
 
@@ -149,23 +173,43 @@ OpenSSH 覆盖七种裸钥/证书协商、PTY/Shell、exec 与 SFTP；Go 网关�
 
 - API 隔离守卫（`api-isolation.spec.ts`，Chromium + WebKit）：自动基础 JSON Mock、同 context 多页面、用例覆盖、未知 API/未声明写操作失败、查询值脱敏、`route.continue()` 绕过时的 501 JSON 与守卫失败。
 - 主题云端同步（`theme-sync.spec.ts` / `theme-styles.spec.ts`）：GET 多主题库与 activeId 恢复、PUT 载荷和云端状态、带 id 的 DELETE 与本地回退；GET 503/网络错误保留本地选择、PUT/DELETE 失败返回 false，不将本地成功等同于云端成功。
+- 主题背景合成（`theme-background.spec.ts`，Chromium + WebKit 移动端）：保留 Liquid Glass 原有玻璃材质、光晕与 35s 往返轨迹；关键帧仅含 `transform`，六个时刻与旧背景逐帧截图对照（允许轻微栅格采样误差）；覆盖高 DPR 末端、滚动/缩放、主题切换、自定义遮罩/噪点、系统减少动态与 `motion=none`。此处断言渲染/视觉契约，不以易受机器负载影响的 GPU 百分比作为 CI 门禁。
+- 本地字体（`local-fonts.spec.ts`，Chromium + WebKit 移动端）：开发页、实际 Worker 内联 HTML 与 Pages 编辑器相对路径，全部图标连字、字重与 FILL 图形变化、无 Google Fonts 请求、Worker 无独立字体请求。`build/font-assets.test.ts` 验证缺失/外链/独立字体产物会阻断构建，生产构建测试保护定向强制内联策略。
 - 匿名连接表单 axe 检查
 - 服务器弹窗的基本对话框语义、初始焦点和 Escape 关闭
+- 服务器表单布局（`server-modal-layout.spec.ts`，Chromium + WebKit）：四个内置主题 × 三种语言的桌面双栏与常见高度免滚动；密码/私钥/none/Cloudflare CA、隧道与展开 Service Token、320/390/768px 窄屏、短窗口固定操作栏与重开滚动复位、自定义最大字号回退；端口为五位数字时预留原生数字控件空间，新增/编辑仍以数字保存且保留 1–65535/整数/必填校验；匿名连接页共用端口布局。
 - 服务器标签筛选、分页与配置快速克隆
 - 多标签操作：双击内联重命名、空值与失焦恢复、右键菜单项与外部点击关闭
 - Agent 终端选区附件与快捷诊断 Prompt 气泡点击填入
 - Responses 前端任务生命周期：正文结束继续运行、run_end 才结束、requestId 隔离过期帧、中文/繁中/英文错误与留存提示
+- Agent 短线恢复（`agent-recovery.spec.ts`，Chromium + WebKit；`worker/agent-session-sync.test.ts`）：真实 WebSocket close → session_resumed → 状态同步保留原面板；离线期间任务完成且工具只执行一次；重复恢复的文本去重、旧同步响应隔离、待确认操作人工恢复、暂停 Auto 倒计时、状态未知时仍能停止、换号销毁旧面板及全新 Shell 不接管原任务。
 - Agent 草稿账号隔离（`agent-session-draft.test.ts` / `e2e/agent-responses.spec.ts`）：稳定 GitHub ID + 服务器 ID 命名空间、本地管理员、缺失身份禁用、同浏览器换号同局部 ID 不串号、原账号恢复、过期/归属不匹配拒绝、旧无用户草稿删除，以及真实前端退出链路清理与迟到消息不重建。
 - 终端选区复制与焦点恢复
 - 认证挑战对话框、移动端后台连接恢复与分享会话领取
 - IME 回归（`ios-ime.spec.ts` / `agent-responses.spec.ts`，Chromium + WebKit）：终端通过真实 xterm `onData` → Shell 就绪门控 → trzsz → 模拟 socket 验证拼音不泄漏、最终中文只发送一次、确认 Enter 不执行及下一次 Enter 立即可用；覆盖提交后紧接标点、Agent 主输入框/内联编辑的 composition/isComposing/229 保护、Shift+Enter、失焦恢复及文本对话框
 - SFTP 覆盖确认、路径面包屑、表头排序、新建文件、主题样式与 UI 回归
+- SFTP 列表选择（`sftp-list-selection.spec.ts`，Chromium + WebKit）：嵌套点击、Ctrl/Cmd、Shift、右键多选保持、排序/刷新后双击目标与高亮、全选/Escape、空目录与销毁重建；2000 项目录检查固定父容器监听与差量 ARIA 写入，附带非门禁计时证据。
 - 终端抽屉分段切换器：桌面端胶囊轮廓与可辨识边缘、双边异步物理弹簧滑块位移、PC 隐藏移动端更多操作按钮、三大抽屉宽度统一、匿名模式隐藏 AI Agent（display: none）与登录同步解锁
 - 移动端终端交互与用户空间：紧凑顶栏与菜单入口、视口与软键盘动态适配、单指滑动历史、字号响应式断点、移动端抽屉平行入口与 AI 设置弹窗无横向溢出
 - tmux 触摸滚轮（`terminal-touch-scroll.spec.ts`，Chromium + WebKit）：VT200/drag/any 与 SGR/旧式二进制/像素编码、双向滚动、原始面板坐标、Ctrl 状态保留、Shell/连接门控、选区优先、取消/模式切换/断连清理与报文数量上限
 - 终端焦点报告（`terminal-focus-report.spec.ts`，Chromium + WebKit）：真实 Ctrl/Alt 按钮与焦点切换、DECSET 1004、Ctrl+B/方向键、bracketed paste、Shell/连接门控及 iOS IME 回退/去重
 - UI 与样式回归：Liquid Glass 下 AI 模型下拉面板与设置面板滚动能力（overflow 简写防回归）、窄视口弹窗横向溢出消除、主题化滚动条兜底与 .no-scrollbar 样式
 - AI 模型下拉选择（Combobox 展开、选项切换、清空、免密拉取与浅色/暗色主题自适应切换）
+
+### SFTP 列表有限优化的测量
+
+运行 `CI=true pnpm exec playwright test sftp-list-selection.spec.ts --workers=1`，在报告附件 `sftp-list-work` 查看工作量和计时。计时前还原计数插桩；只断言工作量，不用毫秒阈值阻断 CI。
+
+以 `7296477` 为基线，本次 Apple M2 的 2000 项目录对照：
+
+| 项目 | 优化前 | 优化后 |
+| --- | --- | --- |
+| 目录事件监听 | 每次渲染注册 6000 个 | 每面板固定 3 个，刷新不再注册 |
+| 首次单选 / 换选 / 重复点击的 ARIA 写入 | 2000 / 2000 / 2000 | 1 / 2 / 0 |
+| Chromium 同步渲染中位数 / 点击均值 | 14.9ms / 0.70ms | 13.1ms / 0.039ms |
+| WebKit 移动项目同步渲染中位数 / 点击均值 | 33ms / 0.52ms | 30ms / 0.06ms |
+
+这些是一次本机同步 JS 调用对照，不代表完整帧耗时、端到端延迟或其他设备的固定收益。列表仍完整渲染，未引入虚拟列表，未改变排序、选择算法、样式或上传/下载协议。
 
 ## 当前限制
 
