@@ -1,0 +1,70 @@
+name: One-shot Update
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/oneshot-update.yml
+  workflow_dispatch:
+
+concurrency:
+  group: oneshot-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream main (keep fork .github)
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/newbietan/CloudSSH.git || true
+          git fetch --no-tags upstream main
+          echo "上游版本: $(git show upstream/main:package.json | grep '"version"' | head -1)"
+          cp -a .github /tmp/fork-github
+          git merge --no-commit --no-ff upstream/main || true
+          # fork 未改动源码，冲突只可能出现在 .github（fork 自带部署 workflow）：
+          # 一律恢复 fork 自己的 .github，避免 GITHUB_TOKEN 因 workflow 权限被拒
+          rm -rf .github
+          cp -a /tmp/fork-github .github
+          git add -A .github
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::存在 .github 之外的未解决冲突"
+            git ls-files -u
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "已是最新，无需合并"
+            exit 0
+          fi
+          git commit -m "chore: merge upstream main (keep fork .github)"
+          git push origin HEAD:main
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.8.0"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm run build:frontend
+
+      - name: Deploy to Cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy
